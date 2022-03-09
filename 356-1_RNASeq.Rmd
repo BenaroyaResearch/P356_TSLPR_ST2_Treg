@@ -1,0 +1,2980 @@
+---
+title: "P356-1 T-cells"
+author: "Analyst: Alex Hu"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Project Summary
+------
+
+FIXME
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+
+library(apird)
+library(mongolite)
+
+libs <- getProjectLibs("378", searchType = "regex")
+anno <- getAnno(libs)
+rownames(anno) <- anno$libid
+
+counts <- t(getGeneCounts(libs))
+#counts <- read.table(paste0("counts.txt"),sep="\t",header=TRUE,row.names=1)
+
+#write.table(counts,paste0("counts.txt"),sep="\t",quote=FALSE,col.names=NA)
+library(knitr)
+library(dplyr)
+library(ggrepel)
+library(circlize)
+library(ComplexHeatmap)
+# library(ggplot2); theme_set(theme_bw(20) + theme(panel.grid.major = element_blank(), 
+#                                                  panel.grid.minor = element_blank()) +
+#                               theme(legend.key = element_blank()))
+
+library(ggplot2);theme_set(theme_bw(20) + theme(panel.grid.major = element_blank(),
+                                panel.grid.minor = element_blank(),
+                                panel.border = element_rect(colour="black", fill=NA, size=1),
+                                axis.text=element_text(colour="black"),
+                                axis.ticks=element_line(colour="black"))+
+  theme(legend.key = element_blank()))
+
+library(edgeR)
+library(limma)
+library(gplots)
+library(RColorBrewer) 
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(heatmap3)
+library(readxl)
+#library(ggforce)
+#Load Matt's library which includes a function for making barcode plots
+library(geneSetTools)
+library(umap)
+library(reshape2)
+
+datadir = "../../data/2020-08-24/"
+
+plotdir = paste0(datadir,"plots/")
+options(stringsAsFactors = FALSE)
+
+pgrep <- function(s,l){
+  return( l[grep(s,l)])
+}
+
+### This is monocle code for kaz
+options(stringsAsFactors = FALSE)
+expression_matrix <- as.matrix(read.table("../../data/2020-09-07/TTR2_data.csv",sep=","))
+gene_names <- read.table("../../data/2020-09-07/TTR2_anno.csv",sep=",")[,1]
+expression_matrix <- expression_matrix[ !is.na(gene_names),]
+gene_names <- gene_names[ !is.na(gene_names)]
+gene_names[ duplicated(gene_names) ] <- paste0(gene_names[ duplicated(gene_names) ],".2")
+cell_names <- read.table("../../data/2020-09-07/TTR2_cell.csv",sep=",")[,1]
+rownames(expression_matrix) <- gene_names
+colnames(expression_matrix) <- cell_names[2:length(cell_names)]
+####
+
+# filter genes that are genes that are expressed in at last 10% of cells
+expression_matrix <- expression_matrix[rowSums(expression_matrix > 0)  > 0.1*ncol(expression_matrix),]
+gm <- data.frame( gene_short_name=rownames(expression_matrix) )
+rownames(gm) <- gm$gene_short_name
+cds <- new_cell_data_set(expression_matrix, gene_metadata = gm)
+cds <- preprocess_cds(cds, num_dim = 100)
+cds <- reduce_dimension(cds )
+
+```
+
+```{r loading}
+
+metrics <- getMetrics(libs)
+rownames(metrics) <- sapply( metrics$libid_fcid, function(x) strsplit(x,"_")[[1]][1])
+design <- metrics
+design$libId <- str_extract(design$libid_fcid, "lib[0-9]+")
+rownames(design) <- design$libId
+colnames(counts)[1:ncol(counts)] <- str_extract(colnames(counts)[1:ncol(counts)], "lib[0-9]+")
+design <- merge(design, anno, by.x = "libId", by.y="row.names")
+rownames(design) <- design$libId
+design$cdr <- colSums(counts>1)[rownames(design)]
+
+## label which samples are cancer and which are not
+# Could you put different labels on 1_X - 4_X from naïve mice and 5_X – 8_X from mice having cancer? There are 8 different groups and naïve T cell that is for subtraction
+sampnums <- sapply( design$sample_name, function(s) strsplit(s,"_")[[1]][1]) 
+design$cancer <- rep("Tn",nrow(design))
+design$cancer[ sampnums %in% as.character(1:4) ] <- "naive"
+design$cancer[ sampnums %in% as.character(5:8) ] <- "cancer"
+
+
+write.table(designm,"../../data/2021-10-08/annotations.txt",sep="\t",col.names=NA,quote=FALSE)
+```
+
+```{r get TCRs}
+
+
+nameconv <- c("Tn","DN","IL1RL1+","TSLPR+","DP")
+names(nameconv) <- c("CD44low","TSLPR-Il1rl1-","TSLPR-Il1rl1+","TSLPR+Il1rl1-","TSLPR+Il1rl1+")
+designm$sort2 <- factor( nameconv[ designm$sort_short], levels=nameconv)
+
+designm$mid <- sapply(designm$providedSampleName, function(s) strsplit(s,"_")[[1]][1])
+designm$midsort <- paste( designm$mid, designm$sort2, sep="-")
+
+
+tcrs <-  getTcrs(libs, removeBulk = FALSE) # returns 604 chains
+dupnts <- tcrs$full_nt_sequence[ duplicated(tcrs$full_nt_sequence)]
+dupids <-  paste0("s",1:length(dupnts))
+names(dupids) <- dupnts
+tcrs$shared<- tcrs$full_nt_sequence %in% dupnts
+tcrs <- cbind(tcrs, designm[ tcrs$libid, !colnames(designm) %in% colnames(tcrs)])
+tcrs$ntid <- rep(".",nrow(tcrs))
+tcrs[tcrs$shared,"ntid"] <- dupids[ tcrs[tcrs$shared,"full_nt_sequence"]]
+tcrs$mid <- designm[tcrs$libid,"mid"]
+
+table(tcrs[tcrs$shared,"ntid"],tcrs[tcrs$shared,"mid"])
+table(tcrs[tcrs$shared,"ntid"],tcrs[tcrs$shared,"midsort"])
+
+```
+
+```{r set_up_qc_parameters, fig.width=4, fig.height=3}
+#Set QC cuts
+align_cut = 80
+total_reads_cut = 1
+median_cv_cut = 1
+
+
+#Get a colorblind palette
+cb_pal <- colorblind_pal()(8)
+cb_pal <- cb_pal[2:8]
+my_cb_pal <- colorRampPalette(cb_pal)(length(unique(design$Sample.Id)))
+```
+
+RNA-seq Quality Metrics
+------
+
+In performing quality control, the following three metrics are examined:
+
+1. The total number of reads in each library (libraries with less than 1 million reads are suspect for bulk). For single cell, we expect: ????   
+2. The percent alignment of each library (higher is better)   
+3. Median CV coverage. This is the the median coefficient of variation of coverage of the 1000 most highly expressed transcripts. It measures read bias along the transcript. Ideally, this value would be 0.
+
+A histogram plotting the number of reads in P143 libraries is follows. The target number of reads for a bulk library is ~5 million. Many of these libraries have fewer than 1 million reads, which is unfortunate and may be too small to analyze properly. 
+
+```{r qcplots_total_reads, fig.width=4, fig.height=3}
+liborder <- design$libId[ order( design$fastq_total_reads, decreasing=TRUE ) ]
+ggplot(design, aes(x=libId, y=fastq_total_reads/10^6, fill=sort)) + 
+      geom_col() +
+      labs(y = "millions of reads") +
+      geom_hline(yintercept = total_reads_cut, linetype = 4) +
+      theme(text = element_text(size=16)) + 
+      theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + 
+      scale_x_discrete(limits = liborder) 
+invisible(dev.off())
+
+```
+
+The following plots compare the median CV of coverage and the percent alignment of reads in each library. High quality libraries will fall in the upper left quadrant of the box (high percent alignment and low median CV coverage). 
+
+There is a large number of low-quality samples defined by low percent alignment and high median cv coverage, and most of these samples come from patient 31. However, there is a cluster of patient 33 cells that also have high median cv coverage and low percent alignment. Plotting the same libraries with total reads on the Y-axis shows that the patient 33 cells with low alignment are the same cells that have very low read counts.
+
+```{r qcplots_coverage_vs_alignment, fig.width=4, fig.height=3, results='hide'}
+
+g <- ggplot(design, aes(x=median_cv_coverage, y=pct_aligned, color=sort) ) + 
+  geom_point(size=2, alpha=1.0) + 
+  labs(x = "median cv coverage", y = "percent alignment", color ="Patient number")+
+  geom_hline(yintercept =  align_cut)+
+  geom_vline(xintercept =  median_cv_cut)+
+  theme(text = element_text(size=12))
+
+print(g)
+
+png(paste(plotdir,"QC_coverage_vs_alignment.png",sep=""), height = 400, width = 600)
+print(g)
+invisible(dev.off())
+
+```
+
+```{r make_qc_cuts}
+design$qc_pass <- design$fastq_total_reads > total_reads_cut &
+                  design$pct_aligned > align_cut &
+                  design$median_cv_coverage < median_cv_cut
+                  
+
+design_qc <- design %>% dplyr::filter(qc_pass ==TRUE)
+rownames(design_qc) <- design_qc$libId
+counts_qc <- counts[,colnames(counts) %in% design_qc$libId]
+
+```
+
+Sex Check
+------
+To check for sample swaps, the reported sex can be compared to the X and Y chromosome read counts in the sequencing data. The histogram below is colored according to the reported sex and displays the log-ratio of X to Y read counts. The peak of libraries with a high X:Y counts ratio (ie look like samples from females according to sequencing) match the reported sex of female and the peak with a low X:Y ratio match the reported sex. There are some libraries in between the peaks where the sequencing data doesn't provide a clear sex prediction. This suggests that more stringent quality control may be needed. Also, the libraries from patient 33 show a wide variation of count ratios when we expect them to be all roughly the same given that they are from the same patient. 
+
+```{r geneFiltering}
+
+# Get mef features into a bed file
+x <- read.table("../../data/2021-10-08/mm10.ensGene_Mef2c.gtf",sep="\t")
+x$cnum <- gsub("chr","",x[,1])
+x$name <- paste0( x[,3], " ", x[,9])
+x <- x[,c("cnum","V4","V5","name")]
+write.table(x,"../../data/2021-10-08/mm10_mef2_features.bed",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+
+#Get protein coding genes with HGNC symbols
+gene_key <- read.table("../../../data/ensemblkey_GRCm38.txt", header = TRUE,sep = "\t",na.strings = "") 
+genes_mgi <- gene_key[!is.na(gene_key$mgi_symbol),]
+
+ens2entrez <- gene_key[ rownames(comparisons[[1]]) %in% gene_key$ensembl_gene_id, "entrezgene"]
+names(ens2entrez) <-   gene_key[ rownames(comparisons[[1]]) %in% gene_key$ensembl_gene_id, "ensembl_gene_id"]
+
+counts_mgi <- counts_qc[rownames(counts_qc) %in% genes_mgi$ensembl_gene_id,]
+genes_pc <- subset(genes_mgi, genes_mgi$gene_biotype == "protein_coding") #21119
+genes_pc <- genes_pc[!duplicated(genes_pc$ensembl_gene_id),] #remove duplicated ensembl genes #21117
+counts_pc <- merge(genes_pc, counts_qc, by.x="ensembl_gene_id", by.y ="row.names")
+gene_key_pc <- counts_pc[,1:4] #First three columns contain annotation information
+counts_pc <- counts_pc[,5:ncol(counts_pc),] #The remaining columns contain counts information \
+rownames(counts_pc) <- gene_key_pc[,1]
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(counts_in, per_cutoff){
+  #Keep genes with cpm of at least one in at least per_cutoff fraction of libraries
+  #CPM normalize
+  counts_cpm_norm <- as.data.frame(t(t(counts_in*10^6)/colSums(counts_in)))
+  
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((counts_cpm_norm) >= 1) >= per_cutoff*ncol(counts_cpm_norm)
+  counts_filtered <- counts_in[keepRows,]
+  
+  return(counts_filtered)
+  
+}
+
+#Run function to filter lowly expressed genes
+counts_all_filtered <- gene_filter(counts_mgi, 0.20)
+counts_pc_filtered <- gene_filter(counts_pc, 0.20)
+
+normalize_counts <- function(counts_in, method){
+  #normalize using tmm or deconvolution
+  #tmm is good for bulk RNAseq
+  #deconvolution is best for large datasets of single cell RNAseq
+  #deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+  
+  if(method == "decon"){
+  #Normalize using the deconvolution algorithm
+  decon_norm_factors <- computeSumFactors(as.matrix(counts_in))
+  counts_norm <- as.data.frame(t(t(counts_in)/decon_norm_factors))
+  }
+  
+  if(method == "tmm"){
+  #Normalize using the TMM algorithm 
+  dge <- DGEList(counts_in)
+  dge <- calcNormFactors(dge)
+  counts_norm <- cpm(dge, normalized.lib.sizes=TRUE)
+  }
+  
+  return(counts_norm)
+  
+}
+
+counts_pc_norm <- normalize_counts(counts_pc_filtered, "tmm")
+counts_all_norm <- normalize_counts(counts_all_filtered, "tmm")
+
+colnames(counts) <- sapply( colnames(counts), function(s) strsplit(s,"_")[[1]][1] )
+x <- counts[ rownames(counts_pc_norm)[1:20],colnames(counts_pc_norm)]
+y <- counts_pc_norm[1:20,]
+plot(log(x[!is.na(x)]), log(y[!is.na(x)]))
+plot(x[!is.na(x)], y[!is.na(x)])
+
+
+# Create a dataframe of gene names to attach to the DGEList(). Keep both ensembl_gene_id, and hgnc_symbol
+fgenes  <- genes_pc[match(rownames(counts_pc_norm ), genes_pc$ensembl_gene_id), c("ensembl_gene_id", "mgi_symbol")]
+dge <- DGEList(counts=counts_pc_norm, genes=fgenes)
+
+design <- design[ colnames(counts_pc_norm),]
+labcounts_pc_norm <- counts_pc_norm
+cnames <- paste(design$sample_name,design$sort,design$cancer,sep="\n")
+colnames(labcounts_pc_norm) <- cnames
+labcounts_pc_norm <- cbind( data.frame( mgi_symbol=comparisons[[1]][rownames(counts_pc_norm),"mgi_symbol"]), counts_pc_norm)
+
+write.table( labcounts_pc_norm, paste0(plotdir,"normalized_counts.txt"), col.names=NA,quote=FALSE,sep="\t" )
+
+```
+
+Gene Filtering
+------
+A filter is applied to keep only genes with HGNC symbols that have been annotated as protein coding. This keeps `r nrow(genes_pc)` of 64345 genes. A second filter that selects genes with a count of at least one in 10% of libraries is also applied. This keeps `r nrow(counts_pc_filtered)` of the `r nrow(genes_pc)` genes from the first filter. The selected genes are normalized using the TMM (trimmed mean of M values) algorithm.
+
+
+Principal Component Analysis
+------
+Principal component analysis (PCA) looks for broad trends in gene expression across libraries in an unsupervised manner. There is no obviously apparent structure in PCA space, and the amount of variation described by the first two principal components is low, suggesting that there may be no single major overwhelming source of variation (like a batch effect) in the data. 
+
+```{r pca, fig.width=4, fig.height=3}
+#Run PCA on the normalized log2 transformed counts data
+
+dat <- log2(as.data.frame(t(dge$counts))+0.5)
+pca = prcomp(dat, center=TRUE, scale=FALSE)
+#Get PCA resutls and merge with sample information stored in metrics
+sum_pca = summary(pca)
+pca_scores= as.data.frame(pca$x)
+pdatscores <- merge(design_qc, pca_scores, by.x = "libId", by.y="row.names")
+pc1_lab = paste("PC1 (", round(100*sum_pca$importance[2, 1], 1),  "%)", sep="")
+pc2_lab = paste("PC2 (", round(100*sum_pca$importance[2, 2], 1),  "%)", sep="")
+pc3_lab = paste("PC3 (", round(100*sum_pca$importance[2, 3], 1),  "%)", sep="")
+pc4_lab = paste("PC4 (", round(100*sum_pca$importance[2, 4], 1),  "%)", sep="")
+pc5_lab = paste("PC5 (", round(100*sum_pca$importance[2, 5], 1),  "%)", sep="")
+pc6_lab = paste("PC6 (", round(100*sum_pca$importance[2, 6], 1),  "%)", sep="")
+pc3genes <- colnames(dat)[order( -1*abs(pca$rotation[,3]) )[1:75]] 
+
+
+pdatscores$sort_short <- gsub("CD45\\+TCR\\+CD4\\+Foxp3\\+","",pdatscores$sort)
+pdatscores$sort_short <- gsub(" cells","",pdatscores$sort_short)
+png(paste0(plotdir,"pca_sort_cancer.png"),width=500,height=400)
+ggplot(pdatscores[pdatscores$sort != "CD45+TCR+CD4+Foxp3-CD44low cells",],aes(x=PC1,y=PC2,color=cancer)) + geom_point() + facet_wrap(~sort_short) + scale_color_manual(values=c("naive"="black","cancer"="red"))
+dev.off()
+
+png(paste0(plotdir,"pca_sort_cancer.png"),width=450,height=300)
+ggplot(pdatscores[pdatscores$sort != "CD45+TCR+CD4+Foxp3-CD44low cells",],aes(x=PC1,y=PC2,color=sort_short, shape=cancer)) + geom_point(size=3) + scale_shape_manual(values=c("cancer"=17,"naive"=8)) + labs(color="sort",shape="") + scale_color_manual(values=c("black","red","blue","orange"))
+dev.off()
+
+
+make_colors <- function(values){
+  cb_pal <- colorblind_pal()(8)
+  numvals <- length(values)
+  my_cb_pal <- colorRampPalette(cb_pal)(numvals)
+  colorlist = c()
+  for( i in 1:numvals ){
+    colorlist[values[i]] <- my_cb_pal[i]
+  }
+  return(colorlist)
+}
+
+png(paste(plotdir,"PCA_PC1_PC2_stimulation.png",sep=""), height=400, width=600)
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = sample.stimulation, shape= as.factor(Visit.Number.Descriptor) ), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+dev.off()
+
+png(paste(plotdir,"PCA_PC1_PC2_timepoint.png",sep=""), height=400, width=600)
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = as.factor(Visit.Number.Descriptor), shape= sample.stimulation), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+dev.off()
+
+
+p1 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = sample.stimulation ), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab, color="Stimulant")+
+  theme(text = element_text(size=12))
+
+p2 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC3, y=PC4, color = sample.stimulation ), size=1.5)+
+  labs(x = pc3_lab, y = pc4_lab, color="Stimulant")+
+  theme(text = element_text(size=12))
+
+p3 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = as.factor(Visit.Number.Descriptor)  ), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab, color="Study Group")+
+  theme(text = element_text(size=12))
+
+p4 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC3, y=PC4, color = as.factor(Visit.Number.Descriptor) ), size=1.5)+
+  labs(x = pc3_lab, y = pc4_lab, color="Study Group")+
+  theme(text = element_text(size=12))
+
+pushViewport(viewport(layout = grid.layout(2 , 2)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p1, vp = vplayout(1,1)) 
+print(p2, vp = vplayout(1,2))
+print(p3, vp = vplayout(2,1)) 
+print(p4, vp = vplayout(2,2))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC3, color = sample.stimulation ), size=1.5)+
+  labs(x = pc1_lab, y = pc3_lab, color="Study Group")+
+  theme(text = element_text(size=12))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = MEDIAN_CV_COVERAGE), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = fastq_total_reads), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = mapped_reads_w_dups), size=1.5)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+
+
+```
+
+```{r}
+cancerlibs <- design_qc$libid[ design_qc$cancer == "cancer"]
+naivelibs <- design_qc$libid[ design_qc$cancer == "naive"]
+
+
+dat_cancer <- log2(as.data.frame(t(dge$counts[,cancerlibs]))+0.5)
+pca_cancer = prcomp(dat_cancer, center=TRUE, scale=FALSE)
+#Get PCA resutls and merge with sample information stored in metrics
+sum_pca = summary(pca_cancer)
+pca_scores= as.data.frame(pca_cancer$x)
+pdatscores <- merge(design_qc, pca_scores, by.x = "libId", by.y="row.names")
+pc1_lab = paste("PC1 (", round(100*sum_pca$importance[2, 1], 1),  "%)", sep="")
+pc2_lab = paste("PC2 (", round(100*sum_pca$importance[2, 2], 1),  "%)", sep="")
+pc3_lab = paste("PC3 (", round(100*sum_pca$importance[2, 3], 1),  "%)", sep="")
+pc4_lab = paste("PC4 (", round(100*sum_pca$importance[2, 4], 1),  "%)", sep="")
+pc5_lab = paste("PC5 (", round(100*sum_pca$importance[2, 5], 1),  "%)", sep="")
+pc6_lab = paste("PC6 (", round(100*sum_pca$importance[2, 6], 1),  "%)", sep="")
+
+png( paste0(plotdir,"cancer_pca.png"),width=300,height=200)
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = sort_short), size=2)+
+  labs(x = pc1_lab, y = pc2_lab, title="Cancer")+
+  theme(text = element_text(size=12)) + scale_color_manual(values=c("black","red","blue","orange"))
+dev.off()
+
+dat_naive <- log2(as.data.frame(t(dge$counts[,naivelibs]))+0.5)
+pca_naive = prcomp(dat_naive, center=TRUE, scale=FALSE)
+#Get PCA resutls and merge with sample information stored in metrics
+sum_pca = summary(pca_naive)
+pca_scores= as.data.frame(pca_naive$x)
+pdatscores <- merge(design_qc, pca_scores, by.x = "libId", by.y="row.names")
+pc1_lab = paste("PC1 (", round(100*sum_pca$importance[2, 1], 1),  "%)", sep="")
+pc2_lab = paste("PC2 (", round(100*sum_pca$importance[2, 2], 1),  "%)", sep="")
+pc3_lab = paste("PC3 (", round(100*sum_pca$importance[2, 3], 1),  "%)", sep="")
+pc4_lab = paste("PC4 (", round(100*sum_pca$importance[2, 4], 1),  "%)", sep="")
+pc5_lab = paste("PC5 (", round(100*sum_pca$importance[2, 5], 1),  "%)", sep="")
+pc6_lab = paste("PC6 (", round(100*sum_pca$importance[2, 6], 1),  "%)", sep="")
+
+png( paste0(plotdir,"naive_pca.png"),width=300,height=200)
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = sort_short), size=2)+
+  labs(x = pc1_lab, y = pc2_lab, title="Naive")+
+  theme(text = element_text(size=12)) + scale_color_manual(values=c("black","red","blue","orange"))
+dev.off()
+```
+
+```{r volcano}
+
+limma_volcano <- function( gtable, outfile="", title="", gs=c(), anno=TRUE, allanno = FALSE  ){
+  p_cutoff = 0.05
+  fc_cutoff = 1.0
+  
+  ixes = c(1)
+  if( length(gs) == 0){
+    ixes <-  which(gtable$adj.P.Val <= p_cutoff)
+  }else{
+    ixes <- which(gtable$adj.P.Val <= p_cutoff & gtable$mgi_symbol %in% gs)
+  }
+  if( length(ixes) > 50 & (allanno == FALSE) ){
+    ixes <- ixes[1:50]
+  }
+  #png(outfile, height = 600, width = 900)
+  p <- ggplot(data = gtable, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+    geom_point(size=1.5, shape = 19) + scale_color_manual(values = c("orange", "red"))+
+    theme(legend.position = "none") + labs(x="logFC",y="-log10 FDR",title=title)+
+    geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+    geom_vline(xintercept=-fc_cutoff, color="black",linetype="dotted",size=1.0)+
+    geom_vline(xintercept=fc_cutoff, color="black",linetype="dotted",size=1.0)+
+    theme(text = element_text(size=16)) 
+    if(anno & length(ixes)>0){
+      p <- p + geom_text_repel(data=gtable[ixes,], aes(logFC, -log10(adj.P.Val), fontface="bold", label=mgi_symbol), size=4, color="black") 
+    }
+  print(p)
+  #dev.off()
+  return(p)
+}
+
+limma_volcano_highlight <- function( gtable, outfile="", title="", gs=c(), p_cutoff = 0.05, fc_cutoff = 1.0, labp=0.05  ){
+  
+  gtable$highlight <- gtable$mgi_symbol %in% gs
+  gtable <- gtable[ order( gtable$highlight),]
+  
+  ixes = c(1)
+  if( length(gs) == 0){
+    ixes <-  which(gtable$adj.P.Val <= p_cutoff)
+  }else{
+    ixes <- which(gtable$adj.P.Val <= labp & gtable$mgi_symbol %in% gs)
+  }
+  if( length(ixes) > 50 ){
+    ixes <- ixes[1:50]
+  }
+  #png(outfile, height = 600, width = 900)
+  p <- ggplot(data = gtable, aes(x=logFC, y=-log10(adj.P.Val), color = highlight)) +
+    geom_point(size=1.5, shape = 19) + scale_color_manual(values = c("FALSE"="grey", "TRUE"="red"))+
+    theme(legend.position = "none") + labs(x="logFC",y="-log10 FDR",title=title)+
+    geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+    geom_vline(xintercept=-fc_cutoff, color="black",linetype="dotted",size=1.0)+
+    geom_vline(xintercept=fc_cutoff, color="black",linetype="dotted",size=1.0)+
+    theme(text = element_text(size=16)) 
+    if(length(ixes)>0){
+      p <- p + geom_text_repel(data=gtable[ixes,], aes(logFC, -log10(adj.P.Val), fontface="bold", label=mgi_symbol), size=4, color="black") 
+    }
+  print(p)
+  #dev.off()
+  return(p)
+}
+
+p <- limma_volcano_highlight( comparisons3[["TSLPpos:IL1RL1pos"]], gs=hallmark[,"HALLMARK_INFLAMMATORY_RESPONSE"],labp=.5, title="DP positive synergy\nInflammatory Response"); print(p)
+
+p <- limma_volcano_highlight( comparisons[["TSLPRpos.IL1RL1pos.Cancer"]], gs=hallmark[,"HALLMARK_OXIDATIVE_PHOSPHORYLATION"], labp=0.1); print(p)
+
+toplot <- c("cancer.TSLPR.v.IL1RL1","naive.TSLPR.v.IL1RL1")
+for( comp in toplot ){
+  print(comp)
+  gname <- gsub("\\."," ", comp)
+  gname <- gsub("pos","+",gname)
+  gname <- gsub("neg","-",gname)
+  p <- limma_volcano( comparisons[[comp]], title=gname)
+  png( paste0(plotdir,comp,"_volcano.png"), width=400,height=400)
+  print(p)
+  dev.off()
+}
+
+toplot <- c("IL1RL1.naive","IL1RL1.cancer")
+for( comp in toplot ){
+  print(comp)
+  gname <- gsub("\\."," ", comp)
+  gname <- gsub("pos","+",gname)
+  gname <- gsub("neg","-",gname)
+  p <- limma_volcano( comparisons[[comp]], title=gname)
+  png( paste0(plotdir,comp,"_volcano.png"), width=400,height=400)
+  print(p)
+  dev.off()
+}
+
+genes <- comparisons[[1]]$mgi_symbol
+cytokines <- genes[ grepl("^Il",genes)]
+cytokines <- c(cytokines,genes[ grepl("^Tgf",genes)])
+cytokines <- c(cytokines,genes[ grepl("^Ifn",genes)])
+cytokines <- c(cytokines,genes[ grepl("^Tnf",genes)])
+
+for( comp in names(comparisons)[ grepl("Cancer",names(comparisons))] ){
+  print(comp)
+  gname <- gsub("\\."," ", comp)
+  gname <- gsub("pos","+",gname)
+  gname <- gsub("neg","-",gname)
+  p <- limma_volcano( comparisons[[comp]], title=gname, gs = cytokines)
+  png( paste0(plotdir,comp,"_cytokines_volcano.png"), width=400,height=400)
+  print(p)
+  dev.off()
+}
+
+for( comp in names(comparisons4)[2:length(comparisons4)] ){
+  print(comp)
+  gname <- gsub(":","x", comp)
+  #p <- limma_volcano( comparisons4[[comp]], title=comp)
+  #png( paste0(plotdir,"interactionmodel_filtered/",gname,"_volcano.png"), width=400,height=400)
+  p <- limma_volcano( comparisons4[[comp]], title=gname, gs = cytokines)
+  png( paste0(plotdir,"interactionmodel_filtered/",gname,"_cytokines_volcano.png"), width=400,height=400)
+  print(p)
+  dev.off()
+}
+
+```
+
+
+```{r}
+libs <- colnames(dge)
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+designm$sort <- gsub("\\+","p",designm$sort)
+designm$sort <- gsub("\\-","m",designm$sort)
+designm$sort <- gsub(" cells","",designm$sort)
+designm$sort <- relevel(as.factor( designm$sort), ref="CD45pTCRpCD4pFoxp3mCD44low")
+designm$cancer[ designm$cancer == "Tn"] <- "naive"
+designm$cancer <- relevel(as.factor( designm$cancer), ref="naive")
+
+
+#### Design mat 1
+design_mat <- model.matrix(~0+designm$cancer:designm$sort)
+colnames(design_mat) <- gsub("designm\\$cancer","",colnames(design_mat))
+colnames(design_mat) <- gsub("designm\\$sort","",colnames(design_mat))
+colnames(design_mat) <- gsub("(Intercept)","Intercept",colnames(design_mat))
+colnames(design_mat) <- gsub(":",".",colnames(design_mat))
+design_mat <- design_mat[, colSums(design_mat)>0]
+print( colnames(design_mat) ) 
+
+vwts <- voomWithQualityWeights(countsm, design= design_mat, plot=T, span=0.1)
+vfit<- lmFit(vwts, design = design_mat)
+
+cont.matrix <- makeContrasts(
+     TSLPRneg.IL1RL1neg.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     TSLPRpos.IL1RL1neg.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m,
+     TSLPRneg.IL1RL1pos.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     TSLPRpos.IL1RL1pos.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p,
+     Cancer= (cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m  - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p)/4,
+     naive.TSLP = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     naive.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     naive.TSLP.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+      cancer.TSLP = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.TSLP.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     cancer.TSLP.vnaive = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.IL1RL1.vnaive = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.TSLP.IL1RL1.vnaive = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.DN.vnaive = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+
+     
+     cancer.DP.v.TSLPR = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m, 
+     cancer.DP.v.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p, 
+     
+     naive.DP.v.TSLPR = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m, 
+     naive.DP.v.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p, 
+     
+     both.DP.v.TSLPR = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m,
+     both.DP.v.Il1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p + naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     
+     both.TSLP.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     both.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     both.TSLP = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     DPSynergy = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     DPSynergy.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     DNcancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     TSLPcancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     IL1RL1cancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     DPcancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     DNnaive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     TSLPnaive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     IL1RL1naive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     DPnaive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     
+     TSLPR.naive = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     TSLPR.cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     
+     IL1RL1.naive = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m,
+     IL1RL1.cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m,
+     naive.TSLPR.v.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     cancer.TSLPR.v.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     levels=design_mat)
+
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+
+vfit_c <- contrasts.fit(vfit, cont.matrix)
+vfit_c_eb <- eBayes(vfit_c)
+
+comparisons <- list()
+for( i in 1:ncol(cont.matrix) ){
+  compname <- colnames(cont.matrix)[i]
+  z <- topTable (vfit_c_eb, coef = i, number=Inf, sort.by="P")
+  comparisons[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  #write.table( z, paste0(plotdir,compname,"_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+
+z <- comparisons[["TSLPRpos.IL1RL1pos.Cancer"]]
+z <- z[order(z$P.Value),]
+write.table(z[ z$logFC > 0, ], paste0(plotdir,"dp_cancer_up.txt"),quote=FALSE,sep="\t",col.names=NA)
+write.table(z[ z$logFC < 0, ], paste0(plotdir,"dp_cancer_down.txt"),quote=FALSE,sep="\t",col.names=NA)
+
+
+g <- rownames(comparisons[[1]])
+FCs <- data.frame( sapply(comparisons,function(de) de[g,"logFC"]) )
+ggplot( FCs, aes(y=TSLP.IL1RL1, x=TSLP+IL1RL1)) + geom_point(alpha=0.3) + labs(y="logFC\n TSLP IL1RL1\ndouble positive vs. double negative", x= "combined logFC\n TSLP1 IL1RL1\n single positives vs. double negative" )
+
+```
+
+
+```{r start geo submission process}
+
+ganno <- designm
+ganno$sort <- gsub("p","+",ganno$sort); ganno$sort <- gsub("m","-",ganno$sort)
+ganno$title <- paste(ganno$mid,ganno$cancer,ganno$sort, sep=".")
+
+ganno <- data.frame( "Sample name"=ganno$libid,"title"=ganno$title, "source name"="colon", "organism" ="mus musculus", "characteristics: cancer"=ganno$cancer, description="","characteristics: sort"=ganno$sort, "characteristics: mouse id"=ganno$mid, molecule="rna","characteristics: genotype"="Foxp3-yfp B6","processed.data.file"="P356-1_AMERGEFC24AND25M5_200817_combined_counts.csv","raw.data.file"=paste0(ganno$libid,"_AMERGEFC24AND25M5_star_alignments.bam"))
+
+ganno <- ganno[order(ganno[,"Sample.name"]),]
+write.table(ganno,"../../data/tslp_st2_KO_rnaseq/anno.txt",sep="\t",row.names=FALSE,quote=FALSE)
+
+```
+
+```{r alternative}
+libs <- colnames(dge)
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+designm$control <- ifelse( designm$sort == "CD45+TCR+CD4+Foxp3-CD44low cells","TRUE","FALSE")
+designm$control <- relevel( as.factor(designm$control), ref="TRUE")
+designm$TSLP <- ifelse( grepl("TSLPR-",design$sort), "neg", "pos" )
+designm$IL1RL1 <- ifelse( grepl("Il1rl1-",design$sort), "neg", "pos" )
+designm$cancer[ designm$cancer == "Tn"] <- "naive"
+designm$cancer <- ifelse(design$cancer == "cancer","pos","neg")
+designm$cancer <- relevel(as.factor( designm$cancer), ref="neg")
+
+## design_mat_3
+design_mat_3 <- model.matrix(~control + cancer*TSLP*IL1RL1, data=designm)
+vwts3 <- voomWithQualityWeights(countsm, design= design_mat_3, plot=T, span=0.1)
+vfit3<- lmFit(vwts3, design = design_mat_3)
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+vfit_eb_3 <- eBayes(vfit3)
+comparisons3 <- list()
+for( i in 1:ncol(design_mat_3) ){
+  compname <- colnames(design_mat_3)[i]
+  #comparisons_ageseason_stim[[compname]] <- topTable (vfit_c_eb_ageseason_stim, coef = i, number=Inf, sort.by="P")
+  z <- topTable (vfit_eb_3, coef = i, number=Inf, sort.by="P")
+  comparisons3[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  #write.table( z, paste0(plotdir,gsub(":",".",compname),"_interactionmodel_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+
+}
+
+
+```
+
+
+```{r alternative, no Tn}
+libs <- colnames(dge)
+libs <- libs[ design[libs,"sort"] != "CD45+TCR+CD4+Foxp3-CD44low cells" ]
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+designm$TSLP <- ifelse( grepl("TSLPR-",designm$sort), "neg", "pos" )
+designm$IL1RL1 <- ifelse( grepl("Il1rl1-",designm$sort), "neg", "pos" )
+designm$cancer <- ifelse(designm$cancer == "cancer","pos","neg")
+designm$cancer <- relevel(as.factor( designm$cancer), ref="neg")
+
+## design_mat_3
+design_mat_4 <- model.matrix(~cancer*TSLP*IL1RL1, data=designm)
+vwts4 <- voomWithQualityWeights(countsm, design= design_mat_4, plot=T, span=0.1)
+vfit4<- lmFit(vwts4, design = design_mat_4)
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+vfit_eb_4 <- eBayes(vfit4)
+comparisons4 <- list()
+for( i in 1:ncol(design_mat_4) ){
+  compname <- colnames(design_mat_4)[i]
+  #comparisons_ageseason_stim[[compname]] <- topTable (vfit_c_eb_ageseason_stim, coef = i, number=Inf, sort.by="P")
+  z <- topTable (vfit_eb_4, coef = i, number=Inf, sort.by="P")
+  comparisons4[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  #write.table( z, paste0(plotdir,"interactionmodel_filtered/",gsub(":",".",compname),"_interactionmodel_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+
+
+```
+
+```{r alternative, no Tn}
+libs <- colnames(dge)
+libs <- libs[ design[libs,"sort"] != "CD45+TCR+CD4+Foxp3-CD44low cells" ]
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+designm$TSLP <- ifelse( grepl("TSLPR-",designm$sort), "neg", "pos" )
+designm$IL1RL1 <- ifelse( grepl("Il1rl1-",designm$sort), "neg", "pos" )
+designm$cancer <- ifelse(designm$cancer == "cancer","pos","neg")
+designm$cancer <- relevel(as.factor( designm$cancer), ref="neg")
+
+## design_mat_3
+design_mat_5 <- model.matrix(~cancer*(TSLP+IL1RL1), data=designm)
+vwts5 <- voomWithQualityWeights(countsm, design= design_mat_5, plot=T, span=0.1)
+vfit5<- lmFit(vwts5, design = design_mat_5)
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+vfit_eb_5 <- eBayes(vfit5)
+comparisons5 <- list()
+for( i in 1:ncol(design_mat_5) ){
+  compname <- colnames(design_mat_5)[i]
+  #comparisons_ageseason_stim[[compname]] <- topTable (vfit_c_eb_ageseason_stim, coef = i, number=Inf, sort.by="P")
+  z <- topTable (vfit_eb_5, coef = i, number=Inf, sort.by="P")
+  comparisons5[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  #write.table( z, paste0(plotdir,"cancerinteractionmodel_filtered/",gsub(":",".",compname),"_interactionmodel_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+
+
+```
+
+```{r c2 stuff}
+
+library(msigdbr)
+
+c2 = data.frame( msigdbr(species = "Homo sapiens", category = "C2") )
+sets <- unique(c2$gs_name)
+sets <- sets[ grepl("IL[0-9]+",sets) | grepl("PROSTAG",sets) | grepl("CYTOK",sets) ]
+
+c2 <- c2[ c2$gs_name %in% sets,]
+#c2_list <- lapply( sets, function(set)  rownames(comparisons_ageseason_stim[[1]])[ comparisons_ageseason_stim[[1]]$HGNC.symbol %in% c2[ c2$gs_name == set,"human_gene_symbol"]  ] )
+c2_list <- lapply( sets, function(set)  as.character(c2[ c2$gs_name == set,"human_gene_symbol"] ) )
+names(c2_list) <- sets
+
+listToFrame <- function(l){
+  maxN <- max( sapply(l, length))
+  df <- data.frame( sapply( l, function(g) c(as.character(g),rep("",maxN-length(g)))  ) )
+  return(df)
+}
+c2_frame <- listToFrame(c2_list)
+c2_frame <- c2_frame[, apply(c2_frame, 2, function(g) length(unique(g)) > 5 )]
+
+```
+
+```{r gsea}
+library(msigdbr)
+
+untidy_geneset <- function(gs){
+  gs <- gs[order(gs$gs_name),]
+  maxlen <- max(table(gs$gs_name))
+  bounds <- which( !duplicated(gs$gs_name))
+  bounds <- c(bounds,nrow(gs)+1)
+  
+  d <- rep("",maxlen)
+  l <- bounds[2]-bounds[1]
+  d[1:l] <- gs$gene_symbol[bounds[1]:(bounds[2]-1)]
+  
+  for( i in 2:(length(bounds)-1) ){
+    dn <- rep("",maxlen)
+    l <- bounds[i+1]-bounds[i]
+    dn[1:l] <- gs$gene_symbol[bounds[i]:(bounds[i+1]-1)]
+    d <- cbind(d,dn)
+  }
+  colnames(d) <- gs$gs_name[!duplicated(gs$gs_name)]
+  d <- data.frame( rbind( colnames(d),d) )
+  return(d)
+}
+
+hallmark <- msigdbr(species = "Mus musculus", category = "H") %>% dplyr::filter(gs_cat == "H")
+hallmark <- untidy_geneset(hallmark)
+
+c7<- msigdbr(species = "Mus musculus", category = "C7") 
+c7 <- untidy_geneset(c7)
+
+
+
+getGSEAS <- function( comps, vwts, genesets, nrots=5000 ){
+  dmat <- vwts$design
+  gseas <- list()
+  for( comp in names(comps) ){
+    if(grepl("ntercept",comp)){ next }
+    for( gs in names(genesets ) ){
+      compname <- paste0( gs, " ", comp )
+      print(compname)
+      if( compname %in% names(gseas) ){ next }
+      r <- roast(
+      y=vwts,
+      index=ids2indices( genesets[[gs]], identifiers=gene_key$mgi_symbol[match(rownames(vwts), gene_key$ensembl_gene_id)]),
+      design=dmat,
+      contrast= which(colnames(dmat) == comp),
+      nrot=nrots)
+      sigsets <- rownames(r)[r$FDR <= 0.05]# | r$FDR.Mixed <= 0.05]
+      print(length(sigsets))
+      if(length(sigsets)>0){print( r[sigsets,])}
+      gseas[[compname]]  <- r
+      #write.table(r,paste0(plotdir,"interactionmodel_filtered/",comp,"_hallmark.txt"),sep="\t",quote=FALSE,col.names=NA)
+    }
+  }
+  return(gseas)
+}
+
+getGSEAS_contrast <- function( comps, vwts,contmat, genesets, nrots=5000 ){
+  dmat <- vwts$design
+  gseas <- list()
+  for( comp in names(comps) ){
+    if(grepl("ntercept",comp)){ next }
+    for( gs in names(genesets ) ){
+      compname <- paste0( gs, " ", comp )
+      print(compname)
+      if( compname %in% names(gseas) ){ next }
+      r <- roast(
+      y=vwts,
+      index=ids2indices( genesets[[gs]], identifiers=gene_key$mgi_symbol[match(rownames(vwts), gene_key$ensembl_gene_id)]),
+      design=dmat,
+      contrast= contmat[colnames(dmat),comp],
+      nrot=nrots)
+      sigsets <- rownames(r)[r$FDR <= 0.05]# | r$FDR.Mixed <= 0.05]
+      print(length(sigsets))
+      if(length(sigsets)>0){print( r[sigsets,])}
+      gseas[[compname]]  <- r
+      #write.table(r,paste0(plotdir,"interactionmodel_filtered/",comp,"_hallmark.txt"),sep="\t",quote=FALSE,col.names=NA)
+    }
+  }
+  return(gseas)
+}
+genesets <- list(hallmark=hallmark)
+gseas1 <- getGSEAS_contrast( comparisons, vwts, cont.matrix, genesets, 10000)
+sigsets <- c()
+for( compname in names(gseas1)[6:11]){
+#for( compname in names(gseas1)[ grepl("Cancer",names(gseas1)) &  grepl("TSLPR",names(gseas1))]){
+
+  fname <- paste0( plotdir,"gseas/",gsub(" ", ".", compname),".txt")
+  print(compname)
+  print( head(gseas1[[compname]]))
+  sigsets <- unique(c(rownames(gseas1[[compname]])[gseas1[[compname]]$FDR <= 0.05]), sigsets)
+  write.table( gseas1[[compname]], fname, quote=FALSE,col.names=NA,sep="\t")
+}
+
+sigsets <- rownames(gseas1[["hallmark TSLPRpos.IL1RL1pos.Cancer"]])[gseas1[["hallmark TSLPRpos.IL1RL1pos.Cancer"]]$FDR <= 0.05]
+cancernames <- names(gseas1)[ grepl("Cancer",names(gseas1)) &  grepl("TSLPR",names(gseas1))]
+gseasfdrs <- do.call(rbind, lapply(gseas1[cancernames], function(g) -log10(g[sigsets,"PValue"]) * ifelse(g[sigsets,"Direction"] == "Up", 1, -1) ) )
+colnames(gseasfdrs) <- gsub("HALLMARK","",gsub("_"," ",sigsets))
+rownames(gseasfdrs) <- c("DN","TSLPR+","IL1RL1+","DP")
+
+col_fun <- colorRamp2(c(-4, 0, 4), c("blue", "white", "red"))
+Heatmap(t(gseasfdrs), name="-log10 p-value\ndirectional", col=col_fun)
+
+gseas4 <- getGSEAS( comparisons4, vwts4, genesets, 10000)
+gseas3 <- getGSEAS( comparisons3, vwts3, genesets, 10000)
+
+for( comp in names(gseas3)) {
+  print(comp)
+  print(gseas3[[comp]][1:10,c("NGenes","Direction","FDR")])
+}
+
+gseas6 <- getGSEAS( comparisons6, vwts6, genesets, 10000)
+gseas7 <- getGSEAS( comparisons7, vwts7, genesets, 10000)
+
+comp <- "TSLPRpos.IL1RL1pos.Cancer"
+hr <- roast(
+      y=vwts,
+      index=ids2indices( hallmark, identifiers=gene_key$mgi_symbol[match(rownames(vwts), gene_key$ensembl_gene_id)]),
+      design=design_mat,
+      contrast=cont.matrix[colnames(design_mat),comp],
+      nrot=10000)
+head(hr)
+
+genesets <- list(hallmark=hallmark)
+gseas <- list()
+for( comp in names(comparisons4) ){
+  if(grepl("ntercept",comp)){ next }
+  print(comp)
+  for( gs in names(genesets ) ){
+    compname <- paste0( gs, " ", comp )
+    if( compname %in% names(gseas) ){ next }
+    r <- roast(
+    y=vwts4,
+    index=ids2indices(hallmark, identifiers=gene_key$mgi_symbol[match(rownames(vwts4), gene_key$ensembl_gene_id)]),
+    design=design_mat_4,
+    contrast=which( colnames(design_mat_4) == comp),
+    nrot=5000)
+    sigsets <- rownames(r)[r$FDR <= 0.05]# | r$FDR.Mixed <= 0.05]
+    print(length(sigsets))
+    if(length(sigsets)>0){print( r[sigsets,])}
+    gseas[[compname]]  <- r
+    write.table(r,paste0(plotdir,"interactionmodel_filtered/",comp,"_hallmark.txt"),sep="\t",quote=FALSE,col.names=NA)
+  }
+}
+
+```
+
+``` {r goana_and_kegga}
+
+library("org.Mm.eg.db")
+
+tidy_bh_go <- function(go){
+  # For Goana output
+  if("Term" %in% colnames(go) ){
+    up <- go[,c("Term","Ont","N","Up","P.Up")]
+    down <- go[,c("Term","Ont","N","Down","P.Down")]
+    colnames(down) <- c("Term","Ont","N","N Genes Changed","PValue")
+    colnames(up) <- c("Term","Ont","N","N Genes Changed","PValue")
+  }
+  # For Kegga output
+  else{
+    up <- go[,c("Pathway","N","Up","P.Up")]
+    down <- go[,c("Pathway","N","Down","P.Down")]
+    colnames(down) <- c("Pathway","N","N Genes Changed","PValue")
+    colnames(up) <- c("Pathway","N","N Genes Changed","PValue")
+  }
+  down$direction <- rep("Down",nrow(down))
+  up$direction <- rep("Up",nrow(down))
+  go <- rbind(up,down)
+  go$QValue <- p.adjust(go$PValue,method="BH")
+  go <- go[order(go$PValue),]
+  return(go)    
+}
+
+
+kegggo_volcano <- function( wtable, outfile=""  ){
+  #png(outfile, height = 400, width = 600)
+  p_cutoff <- 0.05
+  p <- ggplot(data = wtable, aes(x=direction, y=-log10(QValue), color = direction>0)) +
+    geom_point(size=1.5, shape = 19) + scale_color_manual(values = c("orange", "red"))+
+    theme(legend.position = "none") + xlab("Direction") + ylab("-log10 FDR")+
+    geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+    theme(text = element_text(size=16)) + 
+    geom_text_repel(data=wtable[1:20,], aes(direction, -log10(QValue), fontface="bold", label=Term), size=4) 
+  print(p)
+  #dev.off()
+}
+
+
+keggs <- list()
+gos <- list()
+#for(i in 1:ncol(vfit_c_eb$contrasts) ){
+#for(i in (ncol(vfit_c_eb$contrasts)-1):ncol(vfit_c_eb$contrasts) ){
+for(cname in tncomps ){
+  #cname <- colnames(vfit_c_eb$contrasts)[i]
+  if(cname %in% names(gos)){
+    next
+    go <- gos[[cname]]
+    kegg <- keggs[[cname]]
+    write.table(go,paste0(plotdir,"gseas/go_",cname,".txt"),quote=FALSE,sep="\t",col.names=NA)
+    write.table(kegg,paste0(plotdir,"gseas/kegg_",cname,".txt"),quote=FALSE,sep="\t",col.names=NA)
+    next
+  }
+  if( sum( comparisons[[cname]]$adj.P.Val <= 0.1) == 0){
+    next
+  } 
+  i <- which( colnames(vfit_c_eb$contrasts) == cname )
+  print(i)
+  print( colnames(vfit_c_eb$contrasts)[i])
+  go <- goana(vfit_c_eb,coef=i, species="Mm", geneid=ens2entrez[rownames(vfit_c_eb)],FDR=0.1)
+  go <- tidy_bh_go(go)
+  gos[[colnames(vfit_c_eb$contrasts)[i]]] <- go
+
+  write.table(go,paste0(plotdir,"gseas/go_",cname,".txt"),quote=FALSE,sep="\t",col.names=NA)
+  
+  print(table(go$QValue <= 0.05))
+  
+  kegg <- kegga(vfit_c_eb,coef=i, species="Mm",geneid=ens2entrez[rownames(vfit_c_eb)],FDR=0.1)
+  kegg <- tidy_bh_go(kegg)
+  keggs[[colnames(vfit_c_eb$contrasts)[i]]] <- kegg
+  
+  print(table(kegg$QValue <= 0.05))
+  
+  write.table(kegg,paste0(plotdir,"gseas/kegg_",cname,".txt"),quote=FALSE,sep="\t",col.names=NA)
+}
+
+
+```
+
+```{r jaccard index between cellsigs and IFN response}
+
+design_qc$sort_short <- gsub("CD45\\+TCR\\+CD4\\+Foxp3\\+","",design_qc$sort)
+design_qc$sort_short <- gsub(" cells","",design_qc$sort_short)
+design_qc$sort_short[ design_qc$sort_short == "CD45+TCR+CD4+Foxp3-CD44low" ] <- "CD44low"
+# Heatmaps for cancer
+sortcols <- make_colors[ unique(design_qc$sort_short)]
+
+
+libs <- design_qc$libId
+#libs <- libs[ rev(order(design_qc$cancer, design_qc$sort_short )) ]
+libs <- libs[ rev(order(design_qc$sort_short,design_qc$cancer )) ]
+df <- design_qc[libs,c("sort_short","cancer")] 
+cols <- apply( df, 2, function(col) make_colors(gsub(" ", "",unique(col))))
+cols$cancer <- c("Tn"="grey","naive"="black","cancer"="red")
+ha = HeatmapAnnotation(df=df, col = cols )
+
+sortshort_cols <- make_colors(unique(design_qc$sort_short))
+cd44lowlib <- design_qc$libId[ design_qc$sort_short == "CD44low"]
+for( comp in names(cancercomps)){
+  print(comp)
+  #comp <- names(cancercomps)[[1]]
+  sortshort <- gsub("IL1RL1","Il1rl1",gsub("Cancer","",gsub("\\.","",gsub("pos","+",gsub("neg","-",comp)))))
+  #de <- cancercomps[[comp]]
+  de <- comparisons4[["cancerpos"]]
+  comp <- "cancerpos"
+  de <- de[order(de$P.Value),]
+  g <- de$ensembl_gene_id[ de$adj.P.Val <= 0.05]
+  g <- g[ 1:min(50,length(g))]
+  
+  libs <- design_qc$libId
+  libs <- c( cd44lowlib,libs[ rev(order(design_qc[libs,"cancer"],design_qc[libs,"sort_short"])) ])
+
+  #libs <- libs[ design_qc$sort_short == sortshort]
+  #libs <- c( cd44lowlib,libs[ rev(order(design_qc[libs,"cancer"])) ])
+
+#libs <- libs[ rev(order(design_qc$cancer, design_qc$sort_short )) ]
+  #df <- data.frame("cancer"=design_qc[libs,c("cancer")] )
+  #cols <- list(cancer=c("Tn"="grey","naive"="black","cancer"="red"))
+  df <- design_qc[libs,c("cancer","sort_short")]
+  cols <- list(cancer=c("Tn"="grey","naive"="black","cancer"="red"), sort_short =sortshort_cols)
+  ha = HeatmapAnnotation(df=df, col = cols )
+  
+  toplot <- t(scale(t(log2( counts_pc_norm[g,libs] + 1))))
+  rownames(toplot) <- de[g,"mgi_symbol"]
+  #pdf(paste0(plotdir,comp,"_top50_heatmap.pdf"), width=4, height=8)
+  png(paste0(plotdir,comp,"_top50_heatmap2.png"), width=400, height=800)
+
+  p <-Heatmap(toplot, top_annotation=ha, cluster_columns=FALSE,show_row_names=TRUE,show_column_names=FALSE, name="log2\nnormalized\nexpression",column_title=sortshort)
+  print(p)
+  dev.off()
+}
+
+
+
+```
+
+```{r Just look at cancer}
+
+libs <- colnames(dge)
+libs <- libs[ design[libs,"cancer"]== "cancer"]
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+designm$TSLP <- ifelse( grepl("TSLPR-",designm$sort), "neg", "pos" )
+designm$IL1RL1 <- ifelse( grepl("Il1rl1-",designm$sort), "neg", "pos" )
+
+## design_mat_3
+design_mat_6 <- model.matrix(~TSLP*IL1RL1, data=designm)
+vwts6 <- voomWithQualityWeights(countsm, design= design_mat_6, plot=T, span=0.1)
+vfit6<- lmFit(vwts6, design = design_mat_6)
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+vfit_eb_6 <- eBayes(vfit6)
+comparisons6 <- list()
+for( i in 1:ncol(design_mat_6) ){
+  compname <- colnames(design_mat_6)[i]
+  #comparisons_ageseason_stim[[compname]] <- topTable (vfit_c_eb_ageseason_stim, coef = i, number=Inf, sort.by="P")
+  z <- topTable (vfit_eb_6, coef = i, number=Inf, sort.by="P")
+  comparisons6[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  #write.table( z, paste0(plotdir,"interactionmodel_filtered/",gsub(":",".",compname),"_interactionmodel_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+```
+
+
+```{r Just look at naive}
+
+libs <- colnames(dge)
+libs <- libs[ design_qc[libs,"cancer"]== "naive" & design_qc[libs,"sort_short"] != "Tn"]
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+designm$TSLP <- ifelse( grepl("TSLPR-",designm$sort), "neg", "pos" )
+designm$IL1RL1 <- ifelse( grepl("Il1rl1-",designm$sort), "neg", "pos" )
+
+## design_mat_3
+#design_mat_7 <- model.matrix(~TSLP*IL1RL1, data=designm)
+design_mat_7 <- model.matrix(~TSLP+IL1RL1, data=designm)
+
+vwts7 <- voomWithQualityWeights(countsm, design= design_mat_7, plot=T, span=0.1)
+vfit7<- lmFit(vwts7, design = design_mat_7)
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+vfit_eb_7 <- eBayes(vfit7)
+comparisons7 <- list()
+for( i in 1:ncol(design_mat_7) ){
+  compname <- colnames(design_mat_7)[i]
+  #comparisons_ageseason_stim[[compname]] <- topTable (vfit_c_eb_ageseason_stim, coef = i, number=Inf, sort.by="P")
+  z <- topTable (vfit_eb_7, coef = i, number=Inf, sort.by="P")
+  comparisons7[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  #write.table( z, paste0(plotdir,"interactionmodel_filtered/",gsub(":",".",compname),"_interactionmodel_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+```
+
+```{r look at single positivity in cancer and not other stuff?}
+libs <- colnames(dge)
+countsm <- dge[,libs]
+designm <- design_qc[ colnames(countsm),]
+
+designm$cancer <- factor( as.character(designm$cancer), levels=c("Tn","naive","cancer"))
+designm$TSLPR <- paste( ifelse( grepl("TSLPR\\+",designm$sort), "pos", "neg" ), designm$cancer,sep="." )
+designm$IL1RL1 <-  paste( ifelse( grepl("Il1rl1\\+",designm$sort), "pos", "neg" ), designm$cancer,sep="." )
+designm$TSLPR <- relevel( as.factor(designm$TSLPR),ref="neg.Tn" )
+designm$IL1RL1 <- relevel( as.factor(designm$IL1RL1),ref="neg.Tn" )
+
+design_mat_8 <- model.matrix(~TSLPR + IL1RL1, data=designm)
+
+design_mat_8 <- matrix(1,length(libs),8)
+rownames(design_mat_8) <- libs
+colnames(design_mat_8) <- c("naive.TSLPneg","naive.TSLPpos","naive.IL1RL1neg","naive.IL1RL1pos","cancer.TSLPneg","cancer.TSLPpos","cancer.IL1RL1neg","cancer.IL1RL1pos")
+design_mat_8[libs[designm[libs,"cancer"] == "cancer"],1:4] <- 0
+design_mat_8[libs[designm[libs,"cancer"] == "naive"],5:8] <- 0
+design_mat_8[libs[grepl("TSLPR\\+",designm[libs,"sort_short"])],c(1,5)] <- 0
+design_mat_8[libs[grepl("TSLPR-",designm[libs,"sort_short"])],c(2,6)] <- 0
+design_mat_8[libs[grepl("Il1rl1\\+",designm[libs,"sort_short"])],c(3,7)] <- 0
+design_mat_8[libs[grepl("Il1rl1-",designm[libs,"sort_short"])],c(4,8)] <- 0
+
+
+## design_mat_3
+vwts8 <- voomWithQualityWeights(countsm, design= design_mat_8, plot=T, span=0.1)
+vfit8<- lmFit(vwts8, design = design_mat_8)
+
+
+cont.matrix <- makeContrasts(
+     TSLPRneg.IL1RL1neg.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     TSLPRpos.IL1RL1neg.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m,
+     TSLPRneg.IL1RL1pos.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p,
+     TSLPRpos.IL1RL1pos.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p,
+     Cancer= (cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m  - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p)/4,
+     
+     naive.TSLP = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     naive.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     naive.TSLP.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+      cancer.TSLP = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     cancer.TSLP.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     cancer.DP.v.TSLPR = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m, 
+     cancer.DP.v.IL1RL1 = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p, 
+     
+     naive.DP.v.TSLPR = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m, 
+     naive.DP.v.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p, 
+     
+     
+     both.TSLP.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     both.IL1RL1 = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     both.TSLP = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     
+     DPSynergy = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     DPSynergy.Cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m + cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m,
+     DNcancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     TSLPcancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     IL1RL1cancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     DPcancer.v.Tn = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     DNnaive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     TSLPnaive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1m - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     IL1RL1naive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRmIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     DPnaive.v.Tn = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p - naive.CD45pTCRpCD4pFoxp3mCD44low,
+     TSLPR.naive = naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + naive.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1n - naive.CD45pTCRpCD4pFoxp3pTSLPRnIl1rl1n - naive.CD45pTCRpCD4pFoxp3pTSLPRnIl1rl1p,
+     TSLPR.cancer = cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1p + cancer.CD45pTCRpCD4pFoxp3pTSLPRpIl1rl1n - cancer.CD45pTCRpCD4pFoxp3pTSLPRnIl1rl1n - cancer.CD45pTCRpCD4pFoxp3pTSLPRnIl1rl1p,
+     levels=design_mat)
+
+
+#vfit_eb <- eBayes(vfit)
+#ilc2stimDE <- topTable( vfit_eb, coef=which(colnames(design_mat) == "ILC2.CD137Pos"),number=Inf, sort.by="P")
+#table( ilc2stimDE$adj.P.Val <= 0.05)
+vfit_eb_7 <- eBayes(vfit7)
+comparisons7 <- list()
+for( i in 1:ncol(design_mat_7) ){
+  compname <- colnames(design_mat_7)[i]
+  #comparisons_ageseason_stim[[compname]] <- topTable (vfit_c_eb_ageseason_stim, coef = i, number=Inf, sort.by="P")
+  z <- topTable (vfit_eb_7, coef = i, number=Inf, sort.by="P")
+  comparisons7[[compname]] <- z
+  print(compname)
+  sigs <- z$adj.P.Val <= 0.05
+  print(table(sigs))
+  write.table( z, paste0(plotdir,"interactionmodel_filtered/",gsub(":",".",compname),"_interactionmodel_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+```
+
+```{r umap}
+
+
+#pca = prcomp(log2(as.data.frame(t(counts_all_norm))+1), center=TRUE, scale=FALSE)
+uparams <- umap.defaults
+uparams$n_neighbors <- 5
+uparams$random_state <- 2
+#dat <- scale( log2(as.data.frame(t(counts_all_norm))+1) )
+dat <- log2(as.data.frame(t(counts_pc_norm))+1) 
+
+u <- umap(dat, config = uparams)
+ul <- data.frame( u$layout )
+ul <- cbind(ul, design_qc[rownames(ul),c("sort_short","cancer")] )
+
+ggplot() + 
+  geom_point(data=ul, aes(x=X1, y=X2, color = sort_short, shape=cancer), size=3)+
+  theme(text = element_text(size=12))
+
+### correlation?
+#cormat <- cor( counts_pc_norm, method="spearman")
+cormat <- cor( log2(counts_pc_norm+1), method="pearson")
+
+libs <- colnames(cormat)
+df <- design_qc[libs,c("sort_short","cancer")] 
+cols <- apply( df, 2, function(col) make_colors(gsub(" ", "",unique(col))))
+cols$cancer <- c("Tn"="grey","naive"="black","cancer"="red")
+cols$sort_short <- c("blue","orange","black","red","pink")
+names(cols$sort_short) <- unique(design_qc$sort_short)
+ha = HeatmapAnnotation(df=df, col = cols )
+
+Heatmap(cormat, top_annotation=ha, show_row_names=FALSE,show_column_names=FALSE)
+
+getTopNcorrelates <- function(crow,N=2){
+  crow <- crow[ rev(order(crow))]
+  return(names(crow)[2:(N+1) ])
+}
+top3cor <- t(apply( cormat, 2, getTopNcorrelates ))
+
+
+```
+
+```{r}
+# Make Heatmap of cancer logFC in the four populations
+
+cancercompnames <- c("TSLPRneg.IL1RL1neg.Cancer","TSLPRneg.IL1RL1pos.Cancer","TSLPRpos.IL1RL1neg.Cancer","TSLPRpos.IL1RL1pos.Cancer")
+ctitles <-  c("DN","IL1RL1","TSLP","DP"); names(ctitles) <- cancercompnames
+
+g <- unique( do.call( c, lapply(comparisons[cancercompnames], function(l) rownames(l)[ l$adj.P.Val <= 0.05] )))
+cancerlfcs <- sapply( comparisons[cancercompnames], function(l) l[g,"logFC"])
+colnames(cancerlfcs) <-
+rownames(cancerlfcs) <- g
+
+for( compname in cancercompnames ){
+  print(compname)
+  g <- rownames( comparisons[[compname]] )[ comparisons[[compname]]$adj.P.Val <= 0.05 ]
+  tp <- cancerlfcs[g,]
+  png(paste0(plotdir,compname,"_lfc_heatmap.png"),height=800,width=250)
+  p <- Heatmap( tp, show_row_dend=FALSE,show_column_dend=FALSE,show_row_names=FALSE,name="logFC\nin cancer",column_title = paste0("5% FDR DE Genes\nin cancer ",ctitles[compname] ))
+  print(p)
+  dev.off()
+}
+
+for( compname in cancercompnames ){
+  print(compname)
+  g <- rownames( comparisons[[compname]] )[ comparisons[[compname]]$adj.P.Val <= 0.05 ]
+  g <- g[1:min(50,length(g))]
+  tp <- cancerlfcs[g,]
+  rownames(tp) <- comparisons[[1]][ g,"mgi_symbol"]
+  png(paste0(plotdir,compname,"_lfc_heatmap_top50.png"),height=800,width=350)
+  p <- Heatmap( tp, show_row_dend=FALSE,show_column_dend=FALSE,show_row_names=TRUE,name="logFC\nin cancer",column_title = paste0("5% FDR DE Genes\nin cancer ",ctitles[compname] ))
+  print(p)
+  dev.off()
+}
+
+```
+
+
+```{r heatmapswithtn}
+
+tncomps <- c("DNcancer.v.Tn","TSLPcancer.v.Tn","IL1RL1cancer.v.Tn","DPcancer.v.Tn")
+tncomps <- c(tncomps,gsub("cancer","naive",tncomps))
+ccomps <- c("TSLPRneg.IL1RL1neg.Cancer","TSLPRpos.IL1RL1neg.Cancer","TSLPRneg.IL1RL1pos.Cancer"
+,"TSLPRpos.IL1RL1pos.Cancer")
+sortshorts <- c("TSLPR-Il1rl1-","TSLPR+Il1rl1-","TSLPR-Il1rl1+","TSLPR+Il1rl1+")
+
+for( i in 1:length(tncomps)){
+  tncomp <- tncomps[i]
+  de <- comparisons[[tncomp]]
+  print(tncomp)
+  print( table( ifelse(de$logFC[ de$adj.P.Val <= 0.05] > 0,"up","down") ) )
+  #write.table(comparisons[[tncomp]], paste0(plotdir,tncomp,"_DE.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+
+design_qc$cancer <- factor(design_qc$cancer, levels=c("Tn","naive","cancer"))
+for( i in 1:length(tncomps)){
+  tncomp <- tncomps[i]
+  ccomp <- ccomps[i]
+  sshort <- sortshorts[i]
+  libs <- design_qc$libId[ design_qc$sort_short %in% c("CD44low",sshort)]
+  libs <- libs[ order(design_qc[libs,"cancer"])]
+
+  cols <- list( cancer=c("Tn"="grey","naive"="black","cancer"="red"))
+  ha = HeatmapAnnotation(df=list(cancer=design_qc[libs,"cancer"]), col = cols )
+  
+  g <- comparisons[[ccomp]]$ensembl_gene_id[ comparisons[[ccomp]]$adj.P.Val <= 0.05 ]
+  comparisons[[tncomp]]$val <- log(comparisons[[tncomp]]$P.Value) * sign( comparisons[[tncomp]]$logFC)
+  g <- g[ order(comparisons[[tncomp]][g,"val"])]
+  
+  signs <- c(1,-1)
+  for( j in signs ){
+      tstring <- ifelse( j == 1,"Tn")
+    for( k in signs){
+      gsub <- g[ sign( comparisons[[ccomp]][g,"logFC"]) == j & sign(  comparisons[[tncomp]][g,"logFC"]) == k ]
+      tp <- t(scale(t(log2(counts_pc_norm[gsub,libs]+1) )))
+      rownames(tp) <- comparisons[[1]][gsub,"mgi_symbol"]
+      p <- Heatmap(tp,cluster_rows=FALSE,cluster_columns=FALSE,show_row_names=TRUE,show_column_names=FALSE, top_annotation = ha, name="scaled log2\nexpression", column_title=toupper(sshort) )
+      print(p)
+    break
+    }
+    break
+  }
+  
+ 
+  
+  
+  
+}
+
+
+```
+
+```{r TSLP and IL1RL1 independence}
+g <- rownames(comparisons[[1]])
+FCs <- data.frame( sapply(comparisons,function(de) de[g,"logFC"]) )
+rownames(FCs) <- comparisons[[1]][g,"mgi_symbol"]
+FCs$tnfa <- rownames(FCs) %in% hallmark[,"HALLMARK_TNFA_SIGNALING_VIA_NFKB"]
+FCs$il6 <- rownames(FCs) %in% hallmark[,"HALLMARK_IL6_JAK_STAT3_SIGNALING"]
+FCs$inflam <- rownames(FCs) %in% hallmark[,"HALLMARK_INFLAMMATORY_RESPONSE"]
+
+namconv <- c("neither","TNFA/NFKB","IL6/JAK/STAT3", "both")
+names(namconv) <- c("FALSE FALSE","FALSE TRUE","TRUE FALSE","TRUE TRUE")
+FCs$highlight <- namconv[ paste(FCs$il6, FCs$tnfa) ]
+
+namconv <- c("neither","TNFA/NFKB","INFLAMMATORY", "both")
+names(namconv) <- c("FALSE FALSE","FALSE TRUE","TRUE FALSE","TRUE TRUE")
+FCs$highlight <- namconv[ paste(FCs$inflam, FCs$tnfa) ]
+
+#FCs$highlight <- rownames(FCs) %in% hallmark[,"HALLMARK_INFLAMMATORY_RESPONSE"]
+cols <- c("grey","red","blue","purple")
+names(cols) <- namconv
+
+FCs$highlight <- factor(FCs$highlight, levels=namconv)
+
+FCs <- FCs[ order(FCs$highlight),]
+p1 <- ggplot( FCs, aes(y=naive.TSLP.IL1RL1, x=naive.IL1RL1 + naive.TSLP, color=highlight)) + geom_point(alpha=1) + labs(y="logFC\n TSLP IL1RL1\ndouble positive vs. double negative", x= "combined logFC\n TSLPR IL1RL1\n single positives vs. double negative", title="naive", color="gene pathway" ) + geom_abline(slope=1,color="black",linetype="dashed") + scale_color_manual(values=cols)
+
+p2 <- ggplot( FCs, aes(y=cancer.TSLP.IL1RL1, x=cancer.IL1RL1 + cancer.TSLP, color=highlight)) + geom_point(alpha=1) + labs(y="logFC\n TSLP IL1RL1\ndouble positive vs. double negative", x= "combined logFC\n TSLPR IL1RL1\n single positives vs. double negative", title="cancer", color="gene pathway" ) + geom_abline(slope=1,color="black",linetype="dashed") + scale_color_manual(values=cols)
+
+pushViewport(viewport(layout = grid.layout(1 , 2)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p1, vp = vplayout(1,1)) 
+print(p2, vp = vplayout(1,2))
+
+
+## Here but with certain genes highlighted
+p1 <- ggplot( FCs, aes(y=naive.TSLP.IL1RL1, x=naive.IL1RL1 + naive.TSLP)) + geom_point(alpha=0.3) + labs(y="logFC\n TSLP IL1RL1\ndouble positive vs. double negative", x= "combined logFC\n TSLPR IL1RL1\n single positives vs. double negative", title="naive" ) + geom_abline(slope=1,color="red",linetype="dashed")
+
+p2 <- ggplot( FCs, aes(y=cancer.TSLP.IL1RL1, x=cancer.IL1RL1 + cancer.TSLP)) + geom_point(alpha=0.3) + labs(y="logFC\n TSLP IL1RL1\ndouble positive vs. double negative", x= "combined logFC\n TSLPR IL1RL1\n single positives vs. double negative", title="cancer" ) + geom_abline(slope=1,color="red",linetype="dashed")
+
+pushViewport(viewport(layout = grid.layout(1 , 2)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p1, vp = vplayout(1,1)) 
+print(p2, vp = vplayout(1,2))
+
+
+write.table( comparisons6[["TSLPpos:IL1RL1pos"]][ comparisons6[["TSLPpos:IL1RL1pos"]]$logFC > 0,], paste0(plotdir,"cancer_dp_de.txt"), sep="\t",quote=FALSE,col.names=NA )
+write.table(  comparisons7[["TSLPpos:IL1RL1pos"]][ comparisons7[["TSLPpos:IL1RL1pos"]]$logFC > 0,], paste0(plotdir,"naive_dp_de.txt"), sep="\t",quote=FALSE,col.names=NA )
+
+design_qc$Vangl2 <- counts_pc_norm["ENSMUSG00000026556",design_qc$libId ]
+
+nameconv <- c("Tn","DN","IL1RL1+","TSLPR+","DP")
+names(nameconv) <- c("CD44low","TSLPR-Il1rl1-","TSLPR-Il1rl1+","TSLPR+Il1rl1-","TSLPR+Il1rl1+")
+design_qc$sort2 <- factor( nameconv[ design_qc$sort_short], levels=nameconv)
+design_qc$cancer[ design_qc$sort2 == "Tn"] <- "naive"
+design_qc$sort2cancer <- factor( paste(design_qc$sort2,design_qc$cancer,sep="\n"), levels=c("Tn\nnaive","DN\nnaive","DN\ncancer","IL1RL1+\nnaive","IL1RL1+\ncancer","TSLPR+\nnaive","TSLPR+\ncancer","DP\nnaive","DP\ncancer"))
+
+
+plotgene <- function(g){
+  ens <- rownames(comparisons[[1]])[ comparisons[[1]]$mgi_symbol == g]
+design_qc$g <- counts_pc_norm[ens,design_qc$libId ]
+
+  p <- ggplot(design_qc[design_qc$cancer != "Tn",],aes(x=sort2cancer,y=log2(g+1), color=cancer)) + geom_boxplot(color="grey") + geom_point() + labs(x="sort", title=g, y="log2 expression+1") + scale_color_manual(values=c("naive"="black","cancer"="red")) + guides(color=FALSE)
+  return(p)
+}
+
+print( plotgene("Mapk3") )
+#ggplot(design_qc[design_qc$cancer == "naive",],aes(x=sort2,y=log2(g+1))) + geom_boxplot(color="grey") + geom_point() + labs(x="sort", title=g, y=paste0("log2 expression + 1")) 
+
+
+### Find a gene that is significantly different in both IL1RL1 and TSLPR but the interaction term is not
+g <- rownames(comparisons[[1]])
+g <- g[ comparisons7[["IL1RL1pos"]][g,"adj.P.Val"] <= 0.05 & comparisons7 [["TSLPpos"]][g,"adj.P.Val"] <= 0.05 & comparisons7[["TSLPpos:IL1RL1pos"]][g,"adj.P.Val"] > 0.5]
+
+## Find genes that are different in DP but not in single positive 
+g <- rownames(comparisons[["naive.TSLP.IL1RL1"]])
+g <- g[ comparisons[["naive.TSLP.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["naive.TSLP.IL1RL1"]][g,"logFC"] > 1 &  (comparisons[["naive.TSLP"]][g,"adj.P.Val"] > 0.5 | comparisons[["naive.TSLP"]][g,"logFC"] < 0 ) & ( comparisons[["naive.IL1RL1"]][g,"adj.P.Val"] > 0.5 |comparisons[["naive.TSLP"]][g,"logFC"] < 0 ) ]
+
+write.table( g, paste0(plotdir,"dp_naive_unique_genes.txt"),quote=FALSE,col.names=FALSE,row.names=FALSE,sep="\t")
+
+## Find genes that are different in DP but not in single positive 
+g <- rownames(comparisons[["cancer.TSLP.IL1RL1"]])
+g <- g[ comparisons[["cancer.TSLP.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["cancer.TSLP.IL1RL1"]][g,"logFC"] > 1 &  (comparisons[["cancer.TSLP"]][g,"adj.P.Val"] > 0.5 | comparisons[["cancer.TSLP"]][g,"logFC"] < 0 ) & ( comparisons[["cancer.IL1RL1"]][g,"adj.P.Val"] > 0.5 |comparisons[["cancer.TSLP"]][g,"logFC"] < 0 ) ]
+
+write.table( g, paste0(plotdir,"dp_cancer_unique_genes.txt"),quote=FALSE,col.names=FALSE,row.names=FALSE,sep="\t")
+
+
+g <- rownames(comparisons[["cancer.TSLP.IL1RL1"]])
+g <- g[ comparisons[["cancer.TSLP.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["cancer.TSLP.IL1RL1"]][g,"logFC"] > 1 &  comparisons[["cancer.TSLP"]][g,"adj.P.Val"] > 0.5 & comparisons[["cancer.IL1RL1"]][g,"adj.P.Val"] > 0.5 ]
+
+write.table( g, paste0(plotdir,"dp_cancer_unique_genes.txt"),quote=FALSE,col.names=FALSE,row.names=FALSE,sep="\t")
+
+
+libs <- design_qc$libId
+libs <- libs[ order(design_qc$sort2,design_qc$cancer)]
+
+df <- design_qc[libs,c("sort2","cancer")]
+cols <- apply( df, 2, function(col) make_colors(gsub(" ", "",unique(col))))
+ha = HeatmapAnnotation(df=df, col = cols )
+
+
+tp <- t(scale(t(log2(counts_pc_norm[g[1:50],libs]+1))))
+rownames(tp) <- comparisons[[1]][ rownames(tp),"mgi_symbol"]
+Heatmap(tp,show_column_names=FALSE,top_annotation=ha, cluster_columns=FALSE)
+```
+
+```{r}
+
+# MAke heatmap for indiviual genes
+siggenes <- c()
+for( comp in cancercompnames ){
+  
+  de <- comparisons[[comp]]
+  de <- de[ de$logFC > 0, ]
+  siggenes <- unique(c(siggenes,de$ensembl_gene_id[1:15]))
+}
+#siggenes <- siggenes[1:50]
+
+lfcs <- sapply( comparisons[cancercompnames], function(l) l[siggenes,"logFC"])
+rownames(lfcs) <- comparisons[[1]][siggenes,"mgi_symbol"]
+
+colnames(lfcs) <- c("DN","IL1RL1+","TSLPR+","DP")
+col_fun <- colorRamp2(c(-4, 0, 4), c("blue", "white", "red"))
+#Heatmap(lfcs, name="-logFC", col=col_fun, show_row_names=FALSE)
+Heatmap(lfcs, name="-logFC", col=col_fun, cluster_columns=FALSE)
+
+
+g <- rownames( comparisons[["TSLPRpos.IL1RL1pos.Cancer"]] )[ comparisons[["TSLPRpos.IL1RL1pos.Cancer"]]$adj.P.Val <= 0.05 & comparisons[["TSLPRpos.IL1RL1pos.Cancer"]]$logFC > 0]
+
+siggenes<- g[ (comparisons[["TSLPRneg.IL1RL1pos.Cancer"]][g,"logFC"] < 0 & comparisons[["TSLPRpos.IL1RL1neg.Cancer"]][g,"logFC"] < 0) | (comparisons[["TSLPRneg.IL1RL1pos.Cancer"]][g,"adj.P.Val"] > 0.5 & comparisons[["TSLPRpos.IL1RL1neg.Cancer"]][g,"adj.P.Val"] > 0.5 )]
+
+
+
+```
+
+
+```{r genes that are higher in DP than in either TSLPR}
+g <- rownames(comparisons[[1]])
+
+cancerdpg <- g[ comparisons[["cancer.DP.v.IL1RL1"]][g,"logFC"] > 0 & comparisons[["cancer.DP.v.TSLPR"]][g,"logFC"] > 0 & comparisons[["cancer.DP.v.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["cancer.DP.v.TSLPR"]][g,"adj.P.Val"] <= 0.05 ]
+
+write.table(cancerdpg,paste0(plotdir,"cancer_dp_unique_genes.txt"),quote=FALSE,col.names=FALSE,row.names=FALSE)
+
+naivedpg <- g[ comparisons[["naive.DP.v.IL1RL1"]][g,"logFC"] > 0 & comparisons[["naive.DP.v.TSLPR"]][g,"logFC"] > 0 & comparisons[["naive.DP.v.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["naive.DP.v.TSLPR"]][g,"adj.P.Val"] <= 0.05 ]
+
+write.table(naivedpg,paste0(plotdir,"naive_dp_unique_genes.txt"),quote=FALSE,col.names=FALSE,row.names=FALSE)
+
+
+```
+
+
+```{r  Unspecified heatmaps for Steve}
+
+# Get heatmaps for genes that are different between subsets
+# select genes that are higher in DP
+cancerdpg <- g[ comparisons[["cancer.DP.v.IL1RL1"]][g,"logFC"] > 0 & comparisons[["cancer.DP.v.TSLPR"]][g,"logFC"] > 0 & comparisons[["cancer.DP.v.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["cancer.DP.v.TSLPR"]][g,"adj.P.Val"] <= 0.05 ]
+naivedpg <- g[ comparisons[["naive.DP.v.IL1RL1"]][g,"logFC"] > 0 & comparisons[["naive.DP.v.TSLPR"]][g,"logFC"] > 0 & comparisons[["naive.DP.v.IL1RL1"]][g,"adj.P.Val"] <= 0.05 & comparisons[["naive.DP.v.TSLPR"]][g,"adj.P.Val"] <= 0.05 ]
+naivedpg <- naivedpg[ order(comparisons[["naive.DP.v.IL1RL1"]][naivedpg,"P.Value"]*comparisons[["naive.DP.v.TSLPR"]][naivedpg,"P.Value"]  )]
+g <- unique( c(naivedpg[1:40], cancerdpg))
+
+
+# select genes that are higher in cancer
+cancercomps <- names(comparisons)[ grepl("TSLPR",names(comparisons)) & grepl("\\.Cancer",names(comparisons))]
+for( comp in cancercomps ){
+  comparisons[[comp]] <- comparisons[[comp]][ order(comparisons[[comp]]$P.Value), ]
+}
+N <- 18
+g <- unique( do.call(c, lapply(comparisons[cancercomps], function(l) rownames(l)[ l$logFC > 0][1:N])))
+
+
+libs <- design_qc$libId
+libs <- libs[ order(design_qc[libs,"sort2"],design_qc[libs,"cancer"]) ]
+#libs <- libs[ order(design_qc[libs,"cancer"],design_qc[libs,"sort2"]) ]
+
+df <- design_qc[libs,c("sort2","cancer")]
+cols <- apply( df, 2, function(col) make_colors(gsub(" ", "",unique(col))))
+cols$cancer <- c("Tn"="grey","naive"="black","cancer"="red")
+cols$sort2 <- c("Tn"="grey","DN"="black","TSLPR+"="red","IL1RL1+"="blue","DP"="purple")
+ha = HeatmapAnnotation(df=df, col = cols )
+
+tp <- t(scale(t(log2(1+counts_pc_norm[g,libs]))))
+rownames(tp) <- comparisons[[1]][g,"mgi_symbol"]
+#Heatmap(tp,show_row_dend=FALSE,show_column_names=FALSE,top_annotation=ha,name="scaled\nlog expression")
+
+pdf(paste0(plotdir,"allsamples_cancer_DE_heatmap.pdf"),height=11,width=8)
+Heatmap(tp,show_row_dend=FALSE,show_column_names=FALSE,top_annotation=ha,name="scaled\nlog expression", cluster_columns=FALSE)
+dev.off()
+
+
+
+smodel <- selectModel(dge$counts, list(dp=design_mat_3, sp=design_mat_5), criterion="aic", df.prior=0, s2.prior=NULL)
+ic <- data.frame(smodel$IC)
+ic$pref <- smodel$pref
+ic$P.Value <-  comparisons3[["TSLPpos:IL1RL1pos"]][rownames(ic),"P.Value"]
+ggplot(ic,aes(x=sp,y=dp, color=pref)) + geom_point() + geom_abline(slope=1,color="red")
+
+ggplot(ic,aes(x=sp-dp, y=-log10(P.Value),color=pref)) + geom_point(alpha=0.5) 
+
+
+```
+
+```{r alluvial_diagrams_pct, fig.height=3, fig.width=4}
+deAnno <- function(de){
+  de$anno <- ifelse(de$logFC > 0, "up","down")
+  de$anno[ de$adj.P.Val > 0.05] <- "n.s."
+  return(de)
+}
+
+comparisons <- lapply( comparisons, deAnno )
+table( comparisons[["DPcancer.v.Tn" ]]$anno )
+g <- rownames(comparisons[[1]])
+deAnnos <- data.frame( sapply( comparisons, function(de) de[g,"anno"]) )
+
+tab <- data.frame( table(deAnnos$DPnaive.v.Tn, deAnnos$DPcancer.v.Tn) )
+tab$paste <- paste(tab$Var1, tab$Var2)
+
+tab1 <- cbind( tab, data.frame( cell=rep("naive",nrow(tab)))) 
+tab2 <- cbind( tab, data.frame( cell=rep("cancer",nrow(tab)))) 
+tab2$Var1 <- tab1$Var2
+tab2$Var2 <- tab1$Var1
+df <- rbind(tab1,tab2)  
+
+ggplot(data=df, aes(x=cell,y=Freq,fill=Var1)) + geom_bar(stat="identity",position="stack")
+
+
+ggplot(data=df, aes(x=cell,y=Freq,fill=Var1,alluvium = paste)) + geom_alluvium(aes(fill = paste, colour = paste), alpha = 1)
+
+ggplot(data = df, aes(x = Var1, y = Freq, alluvium = paste)) +
+      geom_alluvium(aes(fill = paste, colour = paste),
+                    alpha = 1)
+
+ggplot(data = df, aes(x = Var1, y = Freq, alluvium = paste)) +
+      geom_alluvium(aes(fill = paste, colour = paste),
+                    alpha = 1)
+
+ggplot(data = df, aes(x = Var1, y = Freq, fill = paste)) + geom_bar(stat="identity",position="stack") 
+
+patients <- unique(cd154_data$patient)
+
+for(patient_id in patients){
+
+patient_data <- cd154_subset_pct %>%
+  dplyr::filter(patient == patient_id)
+  
+g_patient <- ggplot(data = patient_data,
+                         aes(x = visit, y = pct*100, alluvium = subset)) +
+      geom_alluvium(aes(fill = subset, colour = subset),
+                    alpha = 1)+
+      scale_fill_manual(values=subset_colors)+
+      scale_color_manual(values=subset_colors)+
+      labs(x="", y = "%Subset/CD154+", color = "", fill = "", title = patient_id)
+
+print(g_patient)
+
+}
+
+```
+
+```{gene set histograms}
+g <- rownames(comparisons[[1]]
+lfcs <- data.frame( sapply( comparisons, function(de) de[g,"logFC"]) )
+adjPVals <- data.frame( sapply( comparisons, function(de) de[g,"adj.P.Val"]) )
+rownames(lfcs) <- g
+rownames(adjPVals) <- g
+
+lfc_scatter <- function(comp1,comp2,name1,name2,thresh=0.05,title){
+  df <- data.frame( lfc1 = lfcs[,comp1], lfc2 = lfcs[,comp2], sig1 = adjPVals[,comp1] <=thresh, sig2 = adjPVals[,comp2] <= thresh, fdr1 = adjPVals[,comp1], fdr2 = adjPVals[,comp2], mgi = comparisons[[1]][g,"mgi_symbol"])
+  ganno <- c("FALSE FALSE"="N.S.", "TRUE FALSE"=name1, "TRUE TRUE"="both","FALSE TRUE"=name2)
+  gannocols <- c("grey","blue","red","purple"); names(gannocols) <- c("N.S.",name1,name2,"both")
+  df$anno = factor( ganno[ paste( df$sig1, df$sig2, sep=" ")], levels=c("N.S.",name1,name2,"both"))
+  df <- df[ order(df$anno),]
+  df$maxlfc <- apply( df[,c("lfc1","lfc2")], 1, function(r) max(abs(r)))
+  #z <- df[ rev(order(abs(df$lfc1)+abs(df$lfc2))),][1:50,]
+  z <- df[rev(order(df$maxlfc)),][1:50,]
+  lfccor <- cor( df$lfc1, df$lfc2)
+  p <- ggplot( df, aes(x=lfc1,y=lfc2,color=anno)) + geom_point(size=1) + scale_color_manual( values=gannocols) + labs(x=paste("log2 fold-change",name1,sep="\n"),title=paste0(title,"\nPearson correlation: ",round(lfccor,2)), y=paste("log2 fold-change",name2,sep="\n"), color="FDR <= 0.05") + geom_abline( slope=1, linetype="dashed",color="black") + geom_text_repel(data=z, aes(lfc1, lfc2, fontface="bold", label=mgi), size=4) 
+  #print(p)
+  return(p)
+}
+
+
+lfc_scatter_gs <- function(comp1,comp2,name1,name2,thresh=0.05,title, gs_mgi,gsname){
+  df <- data.frame( lfc1 = lfcs[,comp1], lfc2 = lfcs[,comp2], sig1 = adjPVals[,comp1] <=thresh, sig2 = adjPVals[,comp2] <= thresh, fdr1 = adjPVals[,comp1], fdr2 = adjPVals[,comp2], mgi = comparisons[[1]][g,"mgi_symbol"])
+  df$anno = df$mgi %in% gs_mgi
+  z <- df[ df$anno & (df$sig1 | df$sig2),]
+  z <- z[ rev(order(abs(z$lfc1)+abs(z$lfc2))),][1:min(50,nrow(z)),]
+  #z <- df[ rev(order(abs(df$lfc1)+abs(df$lfc2))),][1:50,]
+  lfccor <- cor( df$lfc1, df$lfc2)
+  df <- df[ order(df$anno),]
+  p <- ggplot( df, aes(x=lfc1,y=lfc2,color=anno)) + geom_point(size=1) + scale_color_manual(values=c("grey","red")) + labs(x=paste("log2 fold-change",name1,sep="\n"),title=paste0(title,"\nPearson correlation: ",round(lfccor,2)), y=paste("log2 fold-change",name2,sep="\n"), color=gsname ) + geom_abline( slope=1, linetype="dashed",color="black") + geom_text_repel(data=z, aes(lfc1, lfc2, fontface="bold", label=mgi), size=4,  color="black") 
+  #print(p)
+  return(p)
+}
+
+p <- lfc_scatter_gs( "naive.TSLP","naive.TSLP.IL1RL1","TSLPR+","TSLPR+ IL1RL1+", title="TSLPR+ and TSLPR+IL1RL1+\nvs. double negative",gs_mgi=hallmark[,"HALLMARK_IL2_STAT5_SIGNALING"],gsname="IL2 STAT5\nsignaling")
+print(p)
+
+p <- lfc_scatter( "naive.TSLP","naive.TSLP.IL1RL1","TSLPR+","TSLPR+ IL1RL1+", title="TSLPR+ and TSLPR+IL1RL1+\nvs. double negative"); 
+pdf( paste0(plotdir,"TSLPR_sp_dp_v_dn_naive.pdf"), width=9,height=7)
+print(p)
+dev.off()
+
+
+p <- lfc_scatter( "naive.IL1RL1","naive.TSLP.IL1RL1","IL1RL1+","TSLPR+ IL1RL1+", title="IL1RL1+ and TSLPR+IL1RL1+\nvs. double negative"); 
+pdf( paste0(plotdir,"IL1RL1_sp_dp_v_dn_naive.pdf"), width=9,height=7)
+print(p)
+dev.off()
+
+p <- lfc_scatter( "cancer.TSLP","cancer.TSLP.IL1RL1","TSLPR+","TSLPR+ IL1RL1+", title="TSLPR+ and TSLPR+IL1RL1+\nvs. double negative"); 
+pdf( paste0(plotdir,"TSLPR_sp_dp_v_dn_cancer.pdf"), width=9,height=7)
+print(p)
+dev.off()
+
+
+p <- lfc_scatter( "cancer.IL1RL1","cancer.TSLP.IL1RL1","IL1RL1+","TSLPR+ IL1RL1+", title="IL1RL1+ and TSLPR+IL1RL1+\nvs. double negative"); 
+pdf( paste0(plotdir,"IL1RL1_sp_dp_v_dn_cancer.pdf"), width=9,height=7)
+print(p)
+dev.off()
+
+
+### Now do it with the gene sets but for those four categories....
+name2  <- c("TSLPR+ IL1RL1+")
+for( cancer in c("cancer.","naive.")){
+  for( name1 in c("IL1RL1+","TSLPR+") ){
+    comp2 <- paste0(cancer,"TSLP.IL1RL1")
+    comp1 <- paste0(cancer,ifelse( grepl("IL1RL1",name1), "IL1RL1","TSLP"))
+    
+    fname <- paste0("../../data/2020-08-24/plots/gseas/sp_dp_scatters/",comp1,"/")
+    
+    gs <- rownames( gseas1[[paste0("hallmark ",comp1)]] )[ gseas1[[paste0("hallmark ",comp1)]]$FDR <= 0.05]
+    gs <- unique( c(     gs <- rownames( gseas1[[paste0("hallmark ",comp2)]] )[ gseas1[[paste0("hallmark ",comp2)]]$FDR <= 0.05]
+, gs))
+    print(length(gs))
+
+    for( h in gs ){
+      nam <- tolower(gsub("_","\n",gsub("HALLMARK_","",h)))
+      print( paste(comp1,nam))
+      title = paste0( name1, " and TSLPR+IL1RL1+\nvs. double negative")
+      
+      p <- lfc_scatter_gs( comp1, comp2, name1, name2, title=title,gs_mgi=hallmark[,h],gsname=nam)
+      pdf( paste0(fname,tolower(gsub("HALLMARK_","",gsub("\n","_",h))),".pdf"), width=7,height=6.5)
+      print(p)
+      dev.off()
+      #break
+    }
+    #break
+  }
+  #break
+}
+```
+
+```{r Heatmap instead of circos}
+g <- rownames(comparisons[[1]])
+lfcs <- data.frame( sapply( comparisons, function(de) de[g,"logFC"]) )
+adjPVals <- data.frame( sapply( comparisons, function(de) de[g,"adj.P.Val"]) )
+rownames(lfcs) <- g
+rownames(adjPVals) <- g
+
+
+comptosort <- c("TSLPR-Il1rl1-","TSLPR+Il1rl1-","TSLPR-Il1rl1+","TSLPR+Il1rl1+")
+names(comptosort) <- c("DN","TSLP","IL1RL1","DP")
+tnlib <- design_qc$libId[ design_qc$sort_short == "CD44low"]
+for( sortshort in c("DN","TSLP","IL1RL1","DP") ){
+  comp2 <- paste0( sortshort, "cancer", ".v.Tn")
+  comp1 <- paste0( sortshort, "naive", ".v.Tn")
+
+  libs <- design_qc$libId[ design_qc$sort_short %in% c(comptosort[ sortshort],"Tn") ]
+  libs <- libs[ order(design_qc[libs,"sort_short"], design_qc[libs,"cancer"])]
+    
+  df <- data.frame(cancer = design_qc[libs,"cancer"])
+  cols <- list(cancer=c("naive"="black","cancer"="red"))
+  ha = HeatmapAnnotation(df=df, col = cols )
+
+  
+  #g <- rownames(adjPVals)[ adjPVals[,comp1] <= 0.05 | adjPVals[,comp2] <= 0.05]
+  anno1 <- ifelse( lfcs[g,comp1] < 0, "down","up"); anno1[ adjPVals[g,comp1] > 0.05] <- "n.s.";
+  anno2 <- ifelse( lfcs[g,comp2] < 0, "down","up"); anno2[ adjPVals[g,comp2] > 0.05] <- "n.s.";
+
+  anno1 <- factor( anno1, levels=c("down","n.s.","up"))
+  anno2 <- factor( anno2, levels=c("down","n.s.","up"))
+  names(anno1) <- g
+  names(anno2) <- g
+  
+  annodf <- data.frame( naiveLogFC = lfcs[g,comp1], naiveFDR = adjPVals[g,comp1], naiveAnno = anno1[g], cancerLogFC = lfcs[g,comp2], cancerFDR = adjPVals[g,comp2], cancerAnno = anno2[g], jointAnno = paste(anno1[g], anno2[g]))
+  
+  write.table( annodf, paste0(plotdir,"tn_v_cancer_naive_",sortshort,".txt"), sep="\t", quote=FALSE, col.names=NA)
+  
+  
+  if( FALSE ){ 
+    g <- g[ order(anno1,anno2) ]
+    annocols <- c("n.s."="grey","down"="blue","up"="red")
+    
+    ra <- rowAnnotation(df = data.frame(naive=anno1[g], cancer=anno2[g]), col=list(naive=annocols,cancer=annocols), width = unit(1, "cm"), annotation_name_rot=90 )
+  
+    tp <-log2(1+counts_pc_norm[g,libs])
+    tp <- tp - log2( counts_pc_norm[g,tnlib]+1)
+    pdf( paste0(plotdir,"tn_heatmap_",sortshort,".pdf"), width=5,height=7)
+    p <- Heatmap( tp, show_row_names=FALSE,show_column_names=FALSE,cluster_rows=FALSE,cluster_columns=FALSE,top_annotation=ha, name="log2\nfold change\nvs. Tn", column_title=comptosort[sortshort]) + ra
+    print(p)
+    dev.off()
+  }
+}
+
+
+```
+
+
+```{r barcode plots}
+library(limma)
+
+
+barcode <- function( comp, h, nam=" ", val = "directional FDR" ){
+  if( nam == " " ){
+    nam <- comp
+  }
+  de <- comparisons[[comp]]
+  de$val <- -log10(de$adj.P.Val)*sign(de$logFC)
+  idx <- de$mgi_symbol %in% hallmark[,h]
+  if( val == "directional FDR" ){
+    p <- barcodeplot(de$val,idx, alpha=0.8, 
+              main=paste0(nam,"\n",h),
+              xlab=expression(log[10]~'directional FDR'), quantiles=c(log10(0.05),-log10(0.05)))
+  }
+  else{
+     p <- barcodeplot(de$logFC,idx, alpha=0.8, 
+              main=paste0(nam,"\n",h),
+              xlab=expression(log[2]~'fold-change'), quantiles=c(-1,1))
+  }
+  return(p)
+}
+
+h <- "HALLMARK_IL2_STAT5_SIGNALING"
+for( c1 in c("cancer.DP","naive.DP")){
+  for(c2 in c("TSLPR","IL1RL1") ){
+    comp <- paste0( c1,".v.",c2)
+    print(comp)
+    #print(table(comparisons[[comp]]$adj.P.Val <= 0.05))
+      
+    gs <- rownames( gseas1[[paste0("hallmark ",comp)]] )[ gseas1[[paste0("hallmark ",comp)]]$FDR <= 0.05]
+    print(length(gs))
+    
+    if( length(gs) == 0 ){
+      next
+    }
+    
+    for( h in gs ){
+      #pdf( paste0(plotdir,"gseas/barcodeplots/",comp,"/",h,"_fc.pdf"),width=6,height=3)
+      png( paste0(plotdir,"gseas/barcodeplots/",comp,"/",h,".png"),width=600,height=300)
+      #p <- barcode( comp,h, val="fold-change")
+      p <- barcode( comp,h)
+
+      print(p)
+      dev.off()
+    }
+  }
+}
+
+
+p <- barcode( "TSLPnaive.v.Tn","HALLMARK_IL2_STAT5_SIGNALING")
+print(p)
+
+de <- comparisons[["TSLPnaive.v.Tn"]]
+de$val <- -log10(de$adj.P.Val)*sign(de$logFC)
+idx <- de$mgi_symbol %in% hallmark[,"HALLMARK_IL2_STAT5_SIGNALING"]
+barcodeplot(de$val,idx, alpha=0.8, 
+            main="Naive TSLPR+ vs. Tn",
+            xlab=expression(log[10]~'directional FDR'), quantiles=c(log10(0.05),-log10(0.05)))
+
+de <- comparisons[["DPnaive.v.Tn"]]
+de$val <- -log10(de$adj.P.Val)*sign(de$logFC)
+idx <- de$mgi_symbol %in% hallmark[,"HALLMARK_IL2_STAT5_SIGNALING"]
+barcodeplot(de$val,idx, alpha=0.8, 
+            main="Naive DP vs. Tn",
+            xlab=expression(log[10]~'directional FDR'), quantiles=c(log10(0.05),-log10(0.05)))
+
+
+
+barcode_gs <- function( comp, gs1, gs2, nam="", val = "directional FDR" ){
+  if( nam == "" ){
+    nam <- comp
+  }
+  print("THIS IS NAM")
+  print(nam)
+  de <- comparisons[[comp]]
+  de$val <- -log10(de$adj.P.Val)*sign(de$logFC)
+  idx1 <- de$mgi_symbol %in% gs1
+  idx2 <- de$mgi_symbol %in% gs2
+  if( val == "directional FDR" ){
+    p <- barcodeplot(de$val,idx1, idx2, alpha=0.8, 
+              main=paste0(nam),
+              xlab=expression(log[10]~'directional FDR'), quantiles=c(log10(0.05),-log10(0.05)))
+  }
+  else{
+     p <- barcodeplot(de$logFC,idx1, idx2, alpha=0.8, 
+              main=paste0(nam),
+              xlab=expression(log[2]~'fold-change'), quantiles=c(-1,1))
+  }
+  return(p)
+}
+
+
+
+barcode_gs1 <- function( comp, gs1, nam="", val = "directional FDR" ){
+  print("THIS IS NAM")
+  print(nam)
+  de <- comparisons[[comp]]
+  de$val <- -log10(de$adj.P.Val)*sign(de$logFC)
+  idx1 <- de$mgi_symbol %in% gs1
+  if( val == "directional FDR" ){
+    p <- barcodeplot(de$val,idx1,alpha=0.8, 
+              main=paste0(nam),
+              xlab=expression(log[10]~'directional FDR'), quantiles=c(log10(0.05),-log10(0.05)))
+  }
+  else{
+     p <- barcodeplot(de$logFC,idx1, idx2, alpha=0.8, 
+              main=paste0(nam),
+              xlab=expression(log[2]~'fold-change'), quantiles=c(-1,1))
+  }
+  return(p)
+}
+
+
+
+
+for( c1 in c("naive.","cancer.")){
+  for(c2 in c("TSLP","IL1RL1") ){
+  comp1 <- paste0(c1,c2)
+  comp2 <- paste0( c1, "TSLP.IL1RL1")
+    
+  nam1 <- ifelse( c1 == "naive.","Naive\n","Cancer\n")
+  nam2 <- ifelse( c2 == "TSLP","TSLPR+","IL1RL1+")
+  nam <- paste0(nam1,nam2," gene sets in \nTSLPR+ IL1RL1+ cells")
+
+  print(comp2)
+  gs1 <- comparisons[[comp1]]$mgi_symbol[ comparisons[[comp1 ]]$adj.P.Val <= 0.05 & comparisons[[comp1 ]]$logFC > 0]
+  gs2 <- comparisons[[comp1 ]]$mgi_symbol[ comparisons[[comp1 ]]$adj.P.Val <= 0.05 & comparisons[["naive.TSLP"]]$logFC < 0]
+  fname <- paste0(plotdir,"gseas/barcodeplots/",c1,c2,".v.dp.png")
+  print(fname)
+  png( fname,width=600,height=600)
+  p <- barcode_gs(comp2, gs1, gs2,nam  )
+  print(p)
+  dev.off()
+  #break
+  }
+  #break
+}
+
+# Here compare single positives
+for( c1 in c("naive.","cancer.")){
+  for(c2 in c("TSLP","IL1RL1") ){
+  nam1 <- ifelse( c1 == "naive.","Naive\n","Cancer\n")
+  nam2 <- ifelse( c2 == "TSLP","TSLPR+","IL1RL1+")
+  nam3 <- ifelse( c2 == "TSLP","IL1RL1+","TSLPR+")
+
+  comp1 <- paste0(c1,c2)
+  comp2 <- paste0( c1, ifelse( c2 == "TSLP","IL1RL1","TSLP"))
+    
+  
+  nam <- paste0(nam1,nam2," gene sets in \n",nam3," cells")
+
+  print(comp2)
+  gs1 <- comparisons[[comp1]]$mgi_symbol[ comparisons[[comp1 ]]$adj.P.Val <= 0.05 & comparisons[[comp1 ]]$logFC > 0]
+  gs2 <- comparisons[[comp1 ]]$mgi_symbol[ comparisons[[comp1 ]]$adj.P.Val <= 0.05 & comparisons[["naive.TSLP"]]$logFC < 0]
+  fname <- paste0(plotdir,"gseas/barcodeplots/",c1,c2,"_geneset_sp.png")
+  print(fname)
+  png( fname,width=600,height=600)
+  p <- barcode_gs(comp2, gs1, gs2,nam  )
+  print(p)
+  dev.off()
+  #break
+  }
+  #break
+}
+
+### Get particular pathways
+pathways <- c("mapk","apoptosis","jak")
+k <- keggs[[1]]
+k$path <- rownames(k)
+pterms <- sapply( pathways, function(p) k[ grepl(p,tolower(k$Pathway)), ][2,"path"])
+
+kegglinks <- getGeneKEGGLinks(species.KEGG="mmu", convert=FALSE)
+kegggenes <- lapply( pterms, function(p) names(ens2entrez)[ ens2entrez %in% kegglinks$GeneID[ kegglinks$PathwayID == p] & names(ens2entrez) %in% rownames(comparisons[[1]]) ])
+
+
+# Here compare single positives
+for( gs in names(kegggenes) ){
+  for( c1 in c("naive.","cancer.")){
+    for(c2 in c("TSLP","IL1RL1") ){
+    nam1 <- ifelse( c1 == "naive.","Naive\n","Cancer\n")
+    nam2 <- ifelse( c2 == "TSLP","TSLPR+","IL1RL1+")
+
+    comp1 <- paste0(c1,c2)
+    
+    nam <- paste0(nam1,nam2," cells\n",gs, " set")
+    print("A NAM")
+    print(nam)
+    print(paste(gs,comp1))
+    gs1 <- comparisons[[comp1]][ kegggenes[[gs]],"mgi_symbol"]
+    fname <- paste0(plotdir,"gseas/barcodeplots/apop_mapk_jak/",c1,c2,"_",gs,"_sp.png")
+    print(fname)
+    png( fname,width=600,height=600)
+    p <- barcode_gs1(comp1, gs1, nam=nam  )
+    print(p)
+    dev.off()
+    #break
+    }
+    #break
+  }
+}
+
+
+
+# Here compare double positive against
+# single positive
+for( gs in names(kegggenes) ){
+  for( c1 in c("naive.","cancer.")){
+    for(c2 in c("TSLPR","IL1RL1") ){
+    comp1 <- paste0(c1,"DP.v.",c2)
+
+    nam1 <- ifelse( c1 == "naive.","Naive\n","Cancer\n")
+    nam2 <- ifelse( c2 == "TSLPR","TSLPR+","IL1RL1+")
+    nam <- paste0(nam1,"DP vs. ",nam2,"\n",gs, " set")
+
+    print(comp1)
+    gs1 <- comparisons[[comp1]][ kegggenes[[gs]],"mgi_symbol"]
+
+    fname <- paste0(plotdir,"gseas/barcodeplots/apop_mapk_jak/",c1,c2,".v.dp_",gs,".png")
+    print(fname)
+    png( fname,width=600,height=300)
+    p <- barcode_gs1(comp1, gs1, nam  )
+    print(p)
+    dev.off()
+    #break
+    }
+    #break
+  }
+}
+
+
+
+for( gs in names(kegggenes) ){
+  for( c1 in c("naive.","cancer.")){
+    for(c2 in c("TSLP","IL1RL1") ){
+    nam1 <- ifelse( c1 == "naive.","Naive\n","Cancer\n")
+    nam2 <- ifelse( c2 == "TSLP","TSLPR+","IL1RL1+")
+
+    comp1 <- paste0(c1,c2)
+    
+    nam <- paste0(nam1,nam2," cells\n",gs, " set")
+    print("A NAM")
+    print(nam)
+    print(paste(gs,comp1))
+    gs1 <- comparisons[[comp1]][ kegggenes[[gs]],"mgi_symbol"]
+    fname <- paste0(plotdir,"gseas/barcodeplots/apop_mapk_jak/",c1,c2,"_",gs,"_sp.png")
+    print(fname)
+    png( fname,width=600,height=300)
+    p <- barcode_gs1(comp1, gs1, nam=nam  )
+    print(p)
+    dev.off()
+    #break
+    }
+    #break
+  }
+}
+
+
+```
+
+```{r comp histograms}
+g <- rownames(comparisons[[1]])
+lfcs <- data.frame( sapply( comparisons, function(de) de[g,"logFC"]) )
+adjPVals <- data.frame( sapply( comparisons, function(de) de[g,"adj.P.Val"]) )
+rownames(lfcs) <- g
+rownames(adjPVals) <- g
+
+lfcs$anno <- ifelse( lfcs[,"naive.TSLP"] > 0, "up","down")
+lfcs$anno[ adjPVals[,"naive.TSLP"] > 0.05 ] <- "n.s."
+annocols <- c("n.s."="grey","up"="red","down"="blue")
+lfcs$anno <- factor(lfcs$anno, levels=c("n.s.","down","up"))
+
+bw = 0.25
+p1 <- ggplot(lfcs,aes(naive.TSLP, fill=anno)) + geom_histogram(binwidth=bw) + scale_fill_manual( values=annocols)
+p2 <- ggplot(lfcs,aes(naive.TSLP.IL1RL1, fill=anno)) + geom_histogram(binwidth=bw) + scale_fill_manual( values=annocols)
+
+
+pushViewport(viewport(layout = grid.layout(2 , 1)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p1, vp = vplayout(1,1)) 
+print(p2, vp = vplayout(2,1))
+
+
+
+```
+
+
+```{r output TSLPR/IL1RL1 DE genes for string-db}
+
+#comps <- paste(c("TSLPR","TSLPR","IL1RL1","IL1RL1"), c("cancer","naive","cancer","naive"), sep=".")
+comps <- paste( c("cancer","naive","cancer","naive","cancer","naive"), c("TSLP","TSLP.IL1RL1","IL1RL1","TSLP","TSLP.IL1RL1","IL1RL1"), sep=".")
+for( comp in comps ){
+  print(comp)
+  #write.table( gos[[comp]], paste0("../../data/2020-08-24/plots/gseas/receptorGSEAS/go_",comp,".txt"),sep="\t",quote=FALSE,col.names=NA )
+  #write.table( keggs[[comp]], paste0("../../data/2020-08-24/plots/gseas/receptorGSEAS/kegg_",comp,".txt"),sep="\t",quote=FALSE,col.names=NA )
+  kegg <- keggs[[comp]]
+  sigterms <- rownames(kegg)[ kegg$QValue <= 0.05]
+  sigup <- sigterms[ kegg[sigterms,"direction"] == "Up"]
+  sigdown <- substr(sigterms[ kegg[sigterms,"direction"] == "Down"],1,13)
+
+  de <- comparisons[[comp]]; de <- de[de$adj.P.Val <= 0.05,]
+  deup <- de[ de$logFC > 0,]
+  dedown <- de[ de$logFC < 0,]
+  print( table(de$logFC[ de$adj.P.Val <= 0.05] >0) )
+  gup <- deup[ ens2entrez[rownames(dedown)] %in% kegglinks$GeneID[ kegglinks$PathwayID %in% sigup], ]
+  gdown <- dedown[ ens2entrez[rownames(dedown)] %in% kegglinks$GeneID[ kegglinks$PathwayID %in% sigdown],]
+  #print( table( keggs[[comp]]$direction[ keggs[[comp]]$QValue <= 0.05] ))
+  #print( keggs[[comp]][ grepl("JAK",keggs[[comp]]$Pathway),])
+  write.table( rownames(gup), paste0("../../data/2020-08-24/plots/gseas/receptorGSEAS_twogroup/kegg_",comp,"_upENSFDR0.05.txt"),sep="\t",quote=FALSE,col.names=FALSE,row.names=FALSE)
+  write.table( rownames(gdown), paste0("../../data/2020-08-24/plots/gseas/receptorGSEAS_twogroup/kegg_",comp,"_downENSFDR0.05.txt"),sep="\t",quote=FALSE,col.names=FALSE,row.names=FALSE )
+  
+  write.table( gup, paste0("../../data/2020-08-24/plots/gseas/receptorGSEAS_twogroup/kegg_",comp,"_upgenesFDR0.05.txt"),sep="\t",quote=FALSE,col.names=NA)
+  write.table( gdown, paste0("../../data/2020-08-24/plots/gseas/receptorGSEAS_twogroup/kegg_",comp,"_downgenesFDR0.05.txt"),sep="\t",quote=FALSE,col.names=NA)
+}
+
+### Get particular pathways
+pathways <- c("mapk","apoptosis","jak")
+k <- keggs[[1]]
+k$path <- rownames(k)
+pterms <- sapply( pathways, function(p) k[ grepl(p,tolower(k$Pathway)), ][2,"path"])
+
+#kegglinks <- getGeneKEGGLinks(species.KEGG="mmu", convert=FALSE)
+kegggenes <- lapply( pterms, function(p) names(ens2entrez)[ ens2entrez %in% kegglinks$GeneID[ kegglinks$PathwayID == p] & names(ens2entrez) %in% rownames(comparisons[[1]]) ])
+
+
+```
+
+
+```{r single marker volcanos?}
+
+comps <- paste( c("cancer","naive","cancer","naive","cancer","naive"), c("TSLP","TSLP.IL1RL1","IL1RL1","TSLP","TSLP.IL1RL1","IL1RL1"), sep=".")
+
+comps <- unique( c( comps, c("cancer.TSLP.IL1RL1","cancer.DP.v.TSLPR","cancer.DP.v.IL1RL1",        "naive.DP.v.TSLPR","naive.DP.v.IL1RL1","cancer.DP.v.TSLPR") ) )
+
+for( comp in comps ){
+  print(comp)
+  if(FALSE){  
+  p <- limma_volcano( comparisons[[comp]], outfile="", title=gsub("\\."," ",comp), gs=c(), anno=FALSE  )
+  #png( paste0(plotdir,"twogroup_volcanos/",comp,"_volcano.png"), width=400,height=400)
+  pdf( paste0(plotdir,"twogroup_volcanos/",comp,"_volcano.pdf"), width=5.5,height=5.5)
+
+  print(p)
+  dev.off()
+  }
+    p <- limma_volcano( comparisons[[comp]], outfile="", title=gsub("\\."," ",comp), gs=c(), anno=TRUE, allanno=TRUE  )
+  #png( paste0(plotdir,"twogroup_volcanos/",comp,"_annotated_volcano.png"), width=400,height=400)
+  pdf( paste0(plotdir,"twogroup_volcanos/",comp,"_annotated_volcano2.pdf"), width=5.5,height=5)
+  print(p)
+  dev.off()
+  
+  write.table(comparisons[[comp]], paste0(plotdir,"twogroup_volcanos/",comp,"_DE.txt"), sep="\t",quote=FALSE,col.names=NA )
+  #break
+  print( sum( comparisons[[comp]]$adj.P.Val <= 0.05))
+}
+
+```
+
+
+```{r Dias gene set}
+library(readxl)
+
+dias <- data.frame( read_xlsx( "../../doc/mmc2.xlsx") )
+colnames(dias) <- dias[7,]
+dias <- data.frame(dias[8:nrow(dias),1:7])
+dias$logFC <- as.numeric(dias$logFC)
+dias$adj.P.Val <- as.numeric(dias$adj.P.Val)
+
+dias <- dias[ order(dias$logFC),]
+dias_effector_up <- dias$Symbol[ dias$logFC > 1 & dias$adj.P.Val <= 0.05]
+dias_effector_down <- dias$Symbol[ dias$logFC <  -1 & dias$adj.P.Val <= 0.05]
+
+
+barcode <- function( comp, gs1, gs2, nam=" ", val = "directional FDR", gsname = " " ){
+  if( nam == " " ){
+    nam <- comp
+  }
+  de <- comparisons[[comp]]
+  de$val <- -log10(de$adj.P.Val)*sign(de$logFC)
+  idx1 <- de$mgi_symbol %in% gs1
+  idx2 <- de$mgi_symbol %in% gs2
+  if( val == "directional FDR" ){
+    p <- barcodeplot(de$val,idx1, idx2, alpha=0.8, 
+              main=paste0(nam,"\n",gsname),
+              xlab=expression(log[10]~'directional FDR'), quantiles=c(log10(0.05),-log10(0.05)))
+  }
+  else{
+     p <- barcodeplot(de$logFC,idx, alpha=0.8, 
+              main=paste0(nam,"\n",gsname),
+              xlab=expression(log[2]~'fold-change'), quantiles=c(-1,1))
+  }
+  return(p)
+}
+
+comps <- paste( c("cancer","naive","cancer","naive","cancer","naive"), c("TSLP","TSLP.IL1RL1","IL1RL1","TSLP","TSLP.IL1RL1","IL1RL1"), sep=".")
+comps <- unique( c( comps, c("cancer.TSLP.IL1RL1","cancer.DP.v.TSLPR","cancer.DP.v.IL1RL1",        "naive.DP.v.TSLPR","naive.DP.v.IL1RL1","cancer.DP.v.TSLPR") ) )
+
+for(comp in comps){
+  print(comp)
+  png( paste0(plotdir,"gseas/barcodeplots_dias/",comp,"_effector_treg_up_down.png"),width=400,height=300)
+  p <- barcode( comp,dias_effector_up, dias_effector_down, nam=gsub("\\."," ",comp), gsname="Dias Effector T-reg gene sets\nred: up in effector\nblue: down in effector")
+  print(p)
+  dev.off()
+}
+
+genesets <- list(dias = list( dias_activated_down=dias_activated_down, dias_activated_up=dias_activated_up))
+gseas_dias <- getGSEAS_contrast( comparisons, vwts, cont.matrix, genesets, 10000)
+for( compname in paste0("dias ",comps)){
+#for( compname in names(gseas1)[ grepl("Cancer",names(gseas1)) &  grepl("TSLPR",names(gseas1))]){
+
+  fname <- paste0( plotdir,"gseas/barcodeplots_dias/",gsub("\\.", " ", compname),".txt")
+  print(compname)
+  print( head(gseas_dias[[compname]]))
+  sigsets <- unique(c(rownames(gseas_dias[[compname]])[gseas_dias[[compname]]$FDR <= 0.05]), sigsets)
+  write.table( gseas_dias[[compname]], fname, quote=FALSE,col.names=NA,sep="\t")
+}
+
+
+```
+
+```{r go and kegg volcanos for paper}
+
+combine_go_kegg <- function(comp){
+  go <- gos[[comp]][ !duplicated(gos[[comp]]$Term), ]
+  rownames(go) <- go$Term
+  
+  kegg <- keggs[[comp]][ !duplicated(keggs[[comp]]$Pathway),]
+  rownames(kegg) <- kegg$Pathway
+  
+  commoncols <- intersect( colnames(kegg), colnames(go))
+  combo <- rbind( kegg[,commoncols], go[,commoncols])
+  combo <- combo[ order(combo$PValue),]
+  combo$PropChanged <- ifelse( combo$direction == "Up", 1, -1)*combo[,"N Genes Changed"]/combo$N
+  return( combo )
+}
+
+dp.v.tslpr <- combine_go_kegg( "both.DP.v.TSLPR")
+
+pdf( paste0(plotdir,"gseas/","go_kegg_volcano_DP_v_TSLPR.pdf"),width=5,height=6)
+de <- dp.v.tslpr
+de$name <- gsub(" ","\n", rownames(de))
+de$name <- gsub("\nof\n"," of\n",de$name)
+ggplot(de,aes(x=PropChanged,y=-log10(QValue), color=direction)) + geom_point() + geom_hline( yintercept = -log10(0.05), color="black",linetype="dashed") + labs( x="proportion and direction\nof gene set changed",y="-log10 q-value", color="direction in\ndouble positive\ncells", title="KEGG and GO\nTSLPR+ IL1RL1+\nvs. TSLPR+ cells") + scale_color_manual(values=c("Up"="red","Down"="blue")) + geom_text_repel(data=de[1:10,], aes(PropChanged, -log10(QValue), fontface="bold", label=de$name[1:10]), size=4, color="black") + guides(color=FALSE)
+dev.off()
+
+dp.v.il1rl1 <- combine_go_kegg( "both.DP.v.Il1RL1")
+pdf( paste0(plotdir,"gseas/","go_kegg_volcano_DP_v_IL1RL1.pdf"),width=5,height=6)
+de <- dp.v.il1rl1
+de$name <- gsub(" ","\n", rownames(de))
+de$name <- gsub("\nof\n"," of\n",de$name)
+ggplot(de,aes(x=PropChanged,y=-log10(QValue), color=direction)) + geom_point() + geom_hline( yintercept = -log10(0.05), color="black",linetype="dashed") + labs( x="proportion and direction\nof gene set changed",y="-log10 q-value", color="direction in\ndouble positive\ncells", title="KEGG and GO\nTSLPR+ IL1RL1+\nvs. IL1RL1+ cells") + scale_color_manual(values=c("Up"="red","Down"="blue")) + geom_text_repel(data=de[1:10,], aes(PropChanged, -log10(QValue), fontface="bold", label=de$name[1:10]), size=4, color="black") + guides(color=FALSE)
+dev.off()
+
+r <- rownames( dp.v.il1rl1 )
+plot( dp.v.il1rl1[g,"PropChanged"], dp.v.tslpr[g,"PropChanged"])
+
+```
+
+
+```{r here use kegg gene sets to perform gene set enrichment analysis}
+library(fgsea)
+
+dncomps <- c("naive.TSLP","naive.IL1RL1","naive.TSLP.IL1RL1","cancer.TSLP","cancer.IL1RL1","cancer.TSLP.IL1RL1")
+sigpaths <- c()
+for( comp in dncomps ){
+  k <- keggs[[comp]]
+  print(comp)
+  print(head( k[ grepl("MAPK", k$Pathway),]))
+  sigpaths <- unique( c(sigpaths, k$Pathway[ k$QValue <= 0.05]))
+}
+
+signalpaths <- k$Pathway[ grepl("signaling pathway",k$Pathway)]
+sigpathids <- intersect(sigpaths,signalpaths)
+sigpathids <- rownames(k)[ k$Pathway %in% sigpathids & k$direction == "Up"]
+
+highlight <- c("Glycolysis / Gluconeogenesis","Oxidative phosphorylation")
+for( kname in names(keggs) ){
+  k <- keggs[[kname]]
+  if( any(k[ grepl("Glycolysis",k$Pathway),"QValue"] <= 0.05)){
+    print(kname)
+    print( k[ grepl("Glycolysis",k$Pathway),] )
+  }
+}
+
+
+kegggenes <- lapply( sigpathids, function(sigpathid) gsub("mmu:","",kegglinks$V2[ kegglinks$V1 == sigpathid]))
+names(kegggenes) <- k[ sigpathids, "Pathway"]
+
+gs_medians <- sapply( kegggenes, function(gs) apply( scaled[gene_key$ensembl_gene_id[ gene_key$entrezgene %in% gs & gene_key$ensembl_gene_id %in% rownames(scaled)  ],], 2, median))
+
+
+data(examplePathways)
+data(exampleRanks)
+set.seed(42)
+
+
+sort2cancers <- as.character( unique(design_qc$sort2cancer) )
+sort2cancers <- sort2cancers[!is.na(sort2cancers)]
+get_fgsea_kegg <- function(sort2cancer){
+  libs <- design_qc$libId[ design_qc$sort2cancer == sort2cancer & ! is.na(design_qc$sort2cancer) ]
+  if( length(libs) > 1 ){
+    means <- rowMeans( counts_pc_norm[,libs] )
+  }
+  else{
+    means <- counts_pc_norm[,libs]
+  }
+  means <- means[ rev(order(means))]
+  names(means) <- ens2entrez[ names(means)]
+
+  means <- means[ !duplicated(names(means))]
+  fgseaRes <- fgsea(pathways = kegggenes, 
+                  stats    = means,
+                  minSize  = 1,
+                  maxSize  = 500,
+                  nperm = 100000)
+  fgseaRes <- fgseaRes[ order(fgseaRes$padj),]
+  print(sort2cancer)
+  print(head(fgseaRes))
+  fgseaRes <- data.frame(fgseaRes)
+  return(fgseaRes)
+}
+
+fgseas <- lapply( sort2cancers, get_fgsea_kegg)
+names(fgseas) <- sort2cancers
+for( kname in names(fgseas) ){
+  rownames( fgseas[[kname]] ) <-  fgseas[[kname]]$pathway
+}
+
+
+sigpathnames <- rownames(fgseas[[1]])
+fgseaspadjs <- sapply( fgseas, function(k) k[sigpathnames,"padj"])
+rownames(fgseaspadjs) <- sigpathnames
+
+
+
+fgseaspadjs <- melt(fgseaspadjs)
+colnames(fgseaspadjs) <- c("Pathway","sort","FDR")
+fgseaspadjs$cancer <- ifelse( grepl("cancer",fgseaspadjs$sort), "cancer", "naive")
+fgseaspadjs$sort <- sapply(as.character(fgseaspadjs$sort), function(s) strsplit(s,"\n")[[1]][1])
+fgseaspadjs$sort[ is.na(fgseaspadjs$sort)] <- "Tn"
+rownames(fgseaspadjs) <- paste( fgseaspadjs$Pathway, fgseaspadjs$cancer, fgseaspadjs$sort)
+fgseaspadjs <- data.frame(fgseaspadjs)
+
+design_qc$sort2cancer <- as.character(design_qc$sort2cancer)
+design_qc$sort2cancer[ is.na(design_qc$sort2cancer) ] <- "Tn\nnaive"
+sort2cancers <- unique(design_qc$sort2cancer)
+
+sort2cancer_medians <- data.frame(sapply( sort2cancers[ sort2cancers != "Tn\nnaive"], function(s) apply(gs_medians[ design_qc$libId[ design_qc$sort2cancer == s], ],2, median ) ))
+colnames(sort2cancer_medians) <- sort2cancers[ sort2cancers != "Tn\nnaive"]
+sort2cancer_medians[,"Tn\nnaive"] <- gs_medians[ design_qc$libId[ design_qc$sort2cancer == "Tn\nnaive"],] 
+# Convert continous p-values into ranges
+discretizePValue <- function(pvals,bounds){
+  bounds <- bounds[ order(bounds)]
+  vals <- rep( paste0( "> ", bounds[length(bounds)]), length(pvals) )
+  for( i in rev(1:(length(bounds)-1))){
+    vals[ pvals <= bounds[i] ] <- paste0("<= ",bounds[i])
+  }
+  return(vals)
+}
+fgseaspadjs$discrete <- discretizePValue(fgseaspadjs$FDR, c(0.01,0.05,0.1,0.2))
+fgseaspadjs$discrete <- factor(fgseaspadjs$discrete,levels=rev(c("<= 0.01","<= 0.05","<= 0.1","> 0.2")))
+fgseaspadjs$z.score <- apply( fgseaspadjs, 1, function(r) sort2cancer_medians[ r[["Pathway"]], paste(r[["sort"]], r[["cancer"]],sep="\n")] )
+fgseaspadjs$pathway <- gsub(" signaling pathway","", fgseaspadjs$Pathway)
+fgseaspadjs$pathway <- gsub("Signaling pathways ","", fgseaspadjs$pathway)
+fgseaspadjs$pathway <- gsub(" diabetic","\ndiabetic", fgseaspadjs$pathway)
+fgseaspadjs$pathway <- gsub("pluripotency ","pluripotency\n", fgseaspadjs$pathway)
+
+# Cancer
+pdf( "../../data/2020-12-01/fgseas_dotplot_cancer2.pdf",width=9.5,height=6.5)
+ggplot(fgseaspadjs[fgseaspadjs$cancer == "cancer" & ! fgseaspadjs$pathway %in% taboo,],aes(x=pathway,y=sort,size=discrete,color=z.score))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="enrichment FDR", color="median\nz-score",title="Cancer Sorts",y="sort") 
+dev.off()
+# Not cancer
+pdf( "../../data/2020-12-01/fgseas_dotplot_naive2.pdf",width=9.5,height=6.5)
+ggplot(fgseaspadjs[fgseaspadjs$cancer == "naive" & ! fgseaspadjs$pathway %in% taboo,],aes(x=pathway,y=sort,size=discrete,color=z.score))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="enrichment FDR", color="median\nz-score",title="Naive Sorts",y="sort") 
+dev.off()
+```
+
+
+```{r make kegg heatmap}
+
+# Make Heatmap for kegg signaling pathways in all of the subsets vs Tn
+tncomps <- c("DNcancer.v.Tn","TSLPcancer.v.Tn","IL1RL1cancer.v.Tn","DPcancer.v.Tn")
+tncomps <- c(tncomps,gsub("cancer","naive",tncomps))
+
+# Get KEGG signaling pathways that are significant between Tn and any other subset
+paths <- keggs[[1]]$Pathway; paths <- paths[grepl("ignaling pathway",paths)]
+sigpaths <- c()
+for( tncomp in tncomps ){
+  k <- keggs[[tncomp]]
+  print(tncomp)
+  sigs <- rownames(k)[ k$Pathway %in% paths & k$QValue <= 0.05]f
+  sigpaths <- unique(c(sigpaths,sigs))
+  print(k[ k$Pathway %in% paths & k$QValue <= 0.05,c("Pathway","direction")])
+}
+
+kpvals <- sapply( tncomps, function(comp) -log10(keggs[[comp]][sigpaths,"PValue"])*ifelse(keggs[[comp]][sigpaths,"direction"] == "Up",1,-1) )
+rownames(kpvals) <- keggs[[1]][sigpaths,"Pathway"]
+
+Heatmap(kpvals)
+
+for(kname in names(keggs)){
+  print(kname)
+  k <- keggs[[kname]]
+  print(k[k$Pathway == "MAPK signaling pathway",])
+}
+  
+keggs2 <- lapply( keggs, function(k) k[ order(k$PValue),])
+keggs2 <- lapply( keggs2, function(k) k[ !duplicated(k$Pathway),])
+for( kname in names(keggs2) ){
+  rownames( keggs2[[kname]] ) <-  keggs2[[kname]]$Pathway
+}
+
+sigpathnames <- k[ sigpathids, "Pathway"]
+keggpvals <- sapply( keggs2[tncomps], function(k) k[sigpathnames,"QValue"])
+rownames(keggpvals) <- sigpathnames
+
+sigpathids <- c("path:mmu04010",unique( substr(sigpaths,1,13) ))
+kegglinks <- read.table("../../doc/kegg_mmu.txt",header=FALSE)
+kegggenes <- lapply( sigpathids, function(sigpathid) gsub("mmu:","",kegglinks$V2[ kegglinks$V1 == sigpathid]))
+names(kegggenes) <- k[ sigpathids, "Pathway"]
+kegggenes <- lapply( kegggenes, function(l) gene_key$ensembl_gene_id[ gene_key$ensembl_gene_id %in% rownames(comparisons[[1]]) & gene_key$entrezgene %in% l])
+
+# Here, get the p-values vs Tn
+
+
+
+d <- design_qc[ !is.na(as.character(design_qc$sort2cancer)),]
+sort2cancers <- unique(design_qc$sort2cancer)
+sort2cancers <- as.character( sort2cancers[!is.na(sort2cancers)] )
+scaled <- t(scale(t(log2(1+counts_pc_norm))))
+gs_medians <- sapply( kegggenes, function(gs) apply( scaled[gs,], 2, median))
+#gs_medians <- sapply( kegggenes, function(gs) apply( scaled[gs,], 2, mean))
+
+
+sort2cancer_medians <- data.frame(sapply( sort2cancers, function(s) apply(gs_medians[ d$libId[ as.character(d$sort2cancer) == s], ],2, median ) ))
+sort2cancer_medians[,"Tn"] <- as.numeric(gs_medians[ design_qc$libId[ design_qc$sort == "CD45+TCR+CD4+Foxp3-CD44low cells"],])
+#sort2cancer_medians <- sapply( sort2cancers, function(s) apply(gs_medians[ d$libId[ as.character(d$sort2cancer) == s], ],2, mean ) )
+rownames(sort2cancer_medians) <- gsub(" signaling pathway", "", rownames(sort2cancer_medians))
+rownames(sort2cancer_medians) <- gsub("Signaling pathways ", "", rownames(sort2cancer_medians))
+rownames(sort2cancer_medians) <- gsub(" in ", " in\n", rownames(sort2cancer_medians))
+rownames(sort2cancer_medians) <- gsub(" of ", " of\n", rownames(sort2cancer_medians))
+
+png(paste0(plotdir,"Tn_comparison_signaling_heatmap.png"),width=500,height=650)
+Heatmap(sort2cancer_medians,name="median set\nz-score log2\nexpression",column_title="KEGG signaling pathways\nsignificantly different in\nTreg vs Tn")
+dev.off()
+
+sort2cancer_kegg <- sort2cancer_medians
+sort2cancer_kegg$Pathway <- rownames(sort2cancer_kegg)
+sort2cancer_kegg <- melt(sort2cancer_kegg, id=c("Pathway"))
+colnames(sort2cancer_kegg) <- c("Pathway","sort","median")
+
+keggs2 <- lapply( keggs, function(k) k[ order(k$PValue),])
+keggs2 <- lapply( keggs2, function(k) k[ !duplicated(k$Pathway),])
+for( kname in names(keggs2) ){
+  rownames( keggs2[[kname]] ) <-  keggs2[[kname]]$Pathway
+}
+
+```
+
+
+```{r Cancer heatmap for all genes?}
+
+for(ccomp in cancercomps){
+  print(ccomp)
+  print(table(comparisons[[ccomp]]$adj.P.Val <= 0.05))
+}
+
+g <- unique( do.call(c, lapply(comparisons[cancercomps], function(l) rownames(l)[ l$adj.P.Val <= 0.05])))
+
+libs <- design_qc$libId[ design_qc$sort != "CD45+TCR+CD4+Foxp3-CD44low cells"]
+libs <- libs[order(design_qc[libs,"sort2"], design_qc[libs,"cancer"])]
+print( design_qc[libs,c("sort2","cancer")] )
+
+df <- design_qc[libs,c("sort2","cancer")] 
+colnames(df) <- c("sort","cancer")
+df$cancer <- as.character(df$cancer)
+cols <- apply( df, 2, function(col) make_colors(gsub(" ", "",unique(col))))
+cols$cancer <- c("Tn"="grey","naive"="black","cancer"="red")
+cols$sort <- c("DN"="black","IL1RL1+"="blue","TSLPR+"="red","DP"="purple")
+ha = HeatmapAnnotation(df=df, col = cols )
+
+
+tp <- t(scale(t(log2(1+counts_pc_norm[g,libs]))))
+
+png(paste0(plotdir,"cancer_combined_heatmap.png"),width=500,height=500)
+Heatmap(tp, show_row_names=FALSE,show_column_names=FALSE,cluster_columns=FALSE, top_annotation=ha, name="scaled\nlog2\nexpression")
+dev.off()
+```
+
+```{r look at DN comps}
+
+dncomps <- c("naive.TSLP","naive.IL1RL1","naive.TSLP.IL1RL1","cancer.TSLP","cancer.IL1RL1","cancer.TSLP.IL1RL1")
+sigpaths <- c()
+for( comp in dncomps ){
+  k <- keggs[[comp]]
+  print(comp)
+  print(head( k[ grepl("MAPK", k$Pathway),]))
+  sigpaths <- unique( c(sigpaths, k$Pathway[ k$QValue <= 0.05]))
+}
+
+signalpaths <- k$Pathway[ grepl("signaling pathway",k$Pathway)]
+sigpathids <- intersect(sigpaths,signalpaths)
+sigpathids <- rownames(k)[ k$Pathway %in% sigpathids & k$direction == "Up"]
+
+kegggenes <- lapply( sigpathids, function(sigpathid) gsub("mmu:","",kegglinks$V2[ kegglinks$V1 == sigpathid]))
+names(kegggenes) <- k[ sigpathids, "Pathway"]
+kegggenes <- lapply( kegggenes, function(l) gene_key$ensembl_gene_id[ gene_key$ensembl_gene_id %in% rownames(comparisons[[1]]) & gene_key$entrezgene %in% l])
+
+
+
+# Here, get the p-values vs Tn
+d <- design_qc[ !is.na(as.character(design_qc$sort2cancer)),]
+sort2cancers <- unique(design_qc$sort2cancer)
+sort2cancers <- as.character( sort2cancers[!is.na(sort2cancers)] )
+scaled <- t(scale(t(log2(1+counts_pc_norm))))
+gs_medians <- sapply( kegggenes, function(gs) apply( scaled[gs,], 2, median))
+#gs_medians <- sapply( kegggenes, function(gs) apply( scaled[gs,], 2, mean))
+
+
+sort2cancer_medians <- data.frame(sapply( sort2cancers, function(s) apply(gs_medians[ d$libId[ as.character(d$sort2cancer) == s], ],2, median ) ))
+sort2cancer_medians[,"Tn"] <- as.numeric(gs_medians[ design_qc$libId[ design_qc$sort == "CD45+TCR+CD4+Foxp3-CD44low cells"],])
+#sort2cancer_medians <- sapply( sort2cancers, function(s) apply(gs_medians[ d$libId[ as.character(d$sort2cancer) == s], ],2, mean ) )
+rownames(sort2cancer_medians) <- gsub(" signaling pathway", "", rownames(sort2cancer_medians))
+rownames(sort2cancer_medians) <- gsub("Signaling pathways ", "", rownames(sort2cancer_medians))
+rownames(sort2cancer_medians) <- gsub(" in ", " in\n", rownames(sort2cancer_medians))
+rownames(sort2cancer_medians) <- gsub(" of ", " of\n", rownames(sort2cancer_medians))
+
+png(paste0(plotdir,"Tn_comparison_signaling_heatmap.png"),width=500,height=650)
+Heatmap(sort2cancer_medians,name="median set\nz-score log2\nexpression",column_title="KEGG signaling pathways\nsignificantly different\ncompared to TSLPR-ST2- cells")
+dev.off()
+
+### get kegg p-values vs DN
+getCompName <- function(s){
+  cancer <- ifelse( grepl("cancer",s), "cancer","naive")
+  marker <- strsplit(s,"\\.")[[1]][1]
+  marker <- gsub("TSLPR","TSLP",marker)
+  
+  if(marker == "DP"){
+    marker <- "TSLP.IL1RL1"
+  }
+  if( marker == "Tn"){
+    return( paste0("DN",cancer,".v.Tn"))
+  }
+  return(paste0(cancer,".",marker))
+}
+
+sort2cancer_keggpvals <- lapply( colnames(sort2cancer_medians), function(s) keggs2[[getCompName(s)]][k[sigpathids,"Pathway"],"PValue"])
+names(sort2cancer_keggpvals) <- colnames(sort2cancer_medians)
+sort2cancer_keggpvals[["DN.cancer"]] <- rep(1,length(sigpathids))
+sort2cancer_keggpvals[["DN.naive"]] <- rep(1,length(sigpathids))
+sort2cancer_keggpvals <- sapply(sort2cancer_keggpvals, function(s) s)
+rownames(sort2cancer_keggpvals) <-k[sigpathids,"Pathway"]
+
+rownames(sort2cancer_keggpvals) <- gsub(" signaling pathway", "", rownames(sort2cancer_keggpvals))
+rownames(sort2cancer_keggpvals) <- gsub("Signaling pathways ", "", rownames(sort2cancer_keggpvals))
+rownames(sort2cancer_keggpvals) <- gsub(" in ", " in\n", rownames(sort2cancer_keggpvals))
+rownames(sort2cancer_keggpvals) <- gsub(" of ", " of\n", rownames(sort2cancer_keggpvals))
+
+taboo <- c("B cell receptor","Prolactin")
+
+kpvals <- melt( sort2cancer_keggpvals)
+colnames(kpvals) <- c("Pathway","sort","P.Value")
+kmeds <- melt( as.matrix(sort2cancer_medians))
+colnames(kmeds) <- c("Pathway","sort","z.score")
+kpvals$z.score <- kmeds$z.score
+
+# Convert continous p-values into ranges
+discretizePValue <- function(pvals,bounds){
+  bounds <- bounds[ order(bounds)]
+  vals <- rep( paste0( "> ", bounds[length(bounds)]), length(pvals) )
+  for( i in rev(1:(length(bounds)-1))){
+    vals[ pvals <= bounds[i] ] <- paste0("<= ",bounds[i])
+  }
+  return(vals)
+}
+
+kpvals$discrete <- discretizePValue( kpvals$P.Value, c(0.01,0.05,0.1,0.2))
+kpvals$discrete <- factor(kpvals$discrete,levels=rev(c("<= 0.01","<= 0.05","<= 0.1","> 0.2")))
+kpvals$cancer <- grepl("cancer",kpvals$sort)
+kpvals$sort_only <- sapply( as.character(kpvals$sort), function(s) strsplit(s,"\\.")[[1]][1])
+kpvals$sort_only[ kpvals$sort_only %in% c("TSLPR","IL1RL1")] <- paste0(kpvals$sort_only[ kpvals$sort_only %in% c("TSLPR","IL1RL1")],"+")
+kpvals$sort_only <- factor(kpvals$sort_only,levels=c("Tn","DN","IL1RL1+","TSLPR+","DP"))
+
+ggplot(kpvals,aes(x=Pathway,y=sort,size=discrete,color=z.score))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="p-value\nvs. DN", color="median\nz-score")
+
+# Cancer
+pdf( "../../data/2020-12-01/kegg_dotplot_cancer.pdf",width=9,height=6.5)
+ggplot(kpvals[kpvals$cancer & ! kpvals$Pathway %in% taboo,],aes(x=Pathway,y=sort_only,size=discrete,color=z.score))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="p-value\nvs. DN", color="median\nz-score",title="Cancer Sorts",y="sort") 
+dev.off()
+# Not cancer
+pdf( "../../data/2020-12-01/kegg_dotplot_naive.pdf",width=9,height=6.5)
+ggplot(kpvals[!kpvals$cancer & ! kpvals$Pathway %in% taboo,],aes(x=Pathway,y=sort_only,size=discrete,color=z.score))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="p-value\nvs. DN", color="median\nz-score",title="Naive Sorts",y="sort") 
+dev.off()
+
+
+
+### write a ranked list of genes by normalized expression for a sample
+dpnaivelibs <- design_qc$libId[ design_qc$sort2cancer == "DP\nnaive" & ! is.na(design_qc$sort2cancer) ]
+dpnaive_means <- rowMeans( counts_pc_norm[,dpnaivelibs] )
+dpnaive_means <- dpnaive_means[ rev(order(dpnaive_means))]
+
+write.table(names(dpnaive_means),"ordered_dpnaive_means.txt",quote=FALSE,col.names=FALSE,row.names=FALSE)
+
+```
+
+```{r mitochondrial stuff}
+# I think you first showed in your presentation in genomic core lab meeting that DP Tregs are activated in Oxydative phosphorylation in GO. Could you check mitochondria-related GSEM such as Glycolysis phosphorylation, ATP generation and Oxydative phosphorylation? GO terms would be OK.
+c5 = data.frame( msigdbr(species = "Mus musculus", category = "C5") )
+gsnames <- unique(c5$gs_name)
+print( gsnames[ grepl("oxidative",tolower(gsnames)) & grepl("phospho",tolower(gsnames))])
+print( gsnames[ grepl("glycoly",tolower(gsnames)) ])
+print( gsnames[ grepl("_atp",tolower(gsnames)) & !grepl("atpase",tolower(gsnames)) & (grepl("metabolic",tolower(gsnames)) | grepl("biosyn",tolower(gsnames))) ])
+
+sets <- gsnames[ (grepl("oxidative",tolower(gsnames)) & grepl("phospho",tolower(gsnames))) | grepl("glycoly",tolower(gsnames))]
+sets <- unique(c(sets,gsnames[ grepl("_atp",tolower(gsnames)) & !grepl("atpase",tolower(gsnames)) & (grepl("metabolic",tolower(gsnames)) | grepl("biosyn",tolower(gsnames))) ]))
+
+c5 <- c5[ c5$gs_name %in% sets,]
+#c2_list <- lapply( sets, function(set)  rownames(comparisons_ageseason_stim[[1]])[ comparisons_ageseason_stim[[1]]$HGNC.symbol %in% c2[ c2$gs_name == set,"human_gene_symbol"]  ] )
+c5_list <- lapply( sets, function(set)  as.character(c5[ c5$gs_name == set,"gene_symbol"] ) )
+names(c5_list) <- sets
+c5_list <- lapply(c5_list, function(f) rownames(comparisons[[1]])[ comparisons[[1]]$mgi_symbol %in% f] )
+get_fgsea_sets <- function(sort2cancer, sets){
+  libs <- design_qc$libId[ design_qc$sort2cancer == sort2cancer & ! is.na(design_qc$sort2cancer) ]
+  if( length(libs) > 1 ){
+    means <- rowMeans( counts_pc_norm[,libs] )
+  }
+  else{
+    means <- counts_pc_norm[,libs]
+  }
+  means <- means[ rev(order(means))]
+
+  means <- means[ !duplicated(names(means))]
+  fgseaRes <- fgsea(pathways = sets, 
+                  stats    = means,
+                  minSize  = 1,
+                  maxSize  = 500,
+                  nperm = 100000)
+  fgseaRes <- fgseaRes[ order(fgseaRes$padj),]
+  print(sort2cancer)
+  print(head(fgseaRes))
+  fgseaRes <- data.frame(fgseaRes)
+  return(fgseaRes)
+}
+
+fgseas_sets <- lapply( sort2cancers, function(f) get_fgsea_sets(f,c5_list))
+names(fgseas_sets) <- sort2cancers
+for( kname in names(fgseas) ){
+  rownames( fgseas[[kname]] ) <-  fgseas[[kname]]$pathway
+}
+
+```
+
+
+```{r more heatmaps using DN as the comparator?}
+library(Hmisc)
+
+vnaives <- c("naive.TSLP","naive.IL1RL1",             "naive.TSLP.IL1RL1","cancer.TSLP.vnaive","cancer.IL1RL1.vnaive","cancer.TSLP.IL1RL1.vnaive","cancer.DN.vnaive")
+kegggenes_ens <- lapply(kegggenes, function(l) names(ens2entrez)[ ens2entrez %in% l])
+
+genesets <- c(kegggenes_ens, c5_list)
+
+getFgsea <- function(de, gsets = kegggenes){
+  de <- de[ rev(order(de$logFC)),]
+  logFC <- de$logFC
+  names(logFC) <- rownames(de)
+  fgseaRes <- fgsea(pathways = gsets, 
+                    stats    = logFC,
+                    minSize  = 1,
+                    maxSize  = 5000,
+                    nperm = 100000)
+  fgseaRes <- fgseaRes[ order(fgseaRes$padj),]
+  print(head(fgseaRes))
+  fgseaRes <- data.frame(fgseaRes)
+  rownames( fgseaRes) <- fgseaRes$pathway
+  return(fgseaRes)
+}
+
+fgseas2 <- lapply( comparisons[vnaives], function(de) getFgsea(de,genesets))
+fgseas2padjs <- sapply( fgseas2, function(f) f[ names(genesets),"padj"])
+rownames(fgseas2padjs) <- names(genesets)
+logFCs2 <- sapply(  comparisons[vnaives], function(de) sapply(genesets, function(gs) median(de$logFC[rownames(de) %in% gs])))
+
+logFCs2_melted <- melt(logFCs2)
+colnames(logFCs2_melted) <- c("pathway","comparison","Median.logFC")
+fgseas2padjs_melted <- melt(fgseas2padjs[rownames(logFCs2),colnames(logFCs2)])
+colnames(fgseas2padjs_melted ) <- c("pathway","comparison","adj.P.Val")
+
+fgseas_df <- cbind(logFCs2_melted, fgseas2padjs_melted[,"adj.P.Val"])
+colnames(fgseas_df) <- c("pathway","comparison","Median.logFC","adj.P.Val")
+
+fgseas_df$discrete <- discretizePValue(fgseas_df$adj.P.Val, c(0.01,0.05,0.1,0.2))
+fgseas_df$discrete <- factor(fgseas_df$discrete,levels=rev(c("<= 0.01","<= 0.05","<= 0.1","> 0.2")))
+
+fgseas_df$pathway <- as.character(fgseas_df$pathway)
+fgseas_df$pathway[ grepl("GO_", fgseas_df$pathway)] <- tolower(gsub("_", " ",gsub("GO_","",fgseas_df$pathway[ grepl("GO_", fgseas_df$pathway)])))
+
+comp2name <- c("naive TSLPR+","naive IL1RL1+","naive DP","cancer TSLPR+","cancer IL1RL1+","cancer DP","cancer DN")
+names(comp2name) <- unique(fgseas_df$comparison)
+fgseas_df$name <- comp2name[ as.character(fgseas_df$comparison)]
+
+fgseas_df$pathway <- gsub("of ","of\n",fgseas_df$pathway)
+fgseas_df$pathway <- gsub(" signaling pathway","",fgseas_df$pathway)
+
+fgseas_df$name <- factor(fgseas_df$name, levels = c("naive IL1RL1+","naive TSLPR+","naive DP","cancer DN","cancer IL1RL1+","cancer TSLPR+","cancer DP"))
+
+anysig <- unique(fgseas_df$pathway[ fgseas_df$adj.P.Val <= 0.05] )
+pdf( "../../data/2020-12-01/fgseas_dotplot_vNaiveDP_short.pdf",width=7,height=6.5)
+ggplot(fgseas_df[ fgseas_df$pathway %in% anysig & !fgseas_df$pathway %in% taboo,],aes(x=pathway,y=name,size=discrete,color=Median.logFC))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="enrichment FDR", color="median logFC\nvs. naive DN",y="cell sort") 
+dev.off()
+
+anysig <- unique(fgseas_df$pathway[ fgseas_df$adj.P.Val <= 0.05] )
+pdf( "../../data/2020-12-01/fgseas_dotplot_vNaiveDP_all.pdf",width=13,height=6.5)
+ggplot(fgseas_df[ !fgseas_df$pathway %in% taboo,],aes(x=pathway,y=name,size=discrete,color=Median.logFC))+ geom_point() + 
+scale_colour_gradient2(low = "blue",mid="white",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="enrichment FDR", color="median logFC\nvs. naive DN",y="cell sort") 
+dev.off()
+
+# Could you separate these small and bigger plots into cancer and naïve, and into signaling pathways and metabolism including oxidative phosphorylation, atp metabolism/synthesis, and glycolysis. And please add naïve DN in the figure. Figures will be totally 8 plots.
+# I think these figures look diffuse. Is it possible to change the balance of blank spaces and plots like below? And we need to describe full names of pathways in each figures. I think we can turn the plot clockwise 90 degrees.
+
+# 
+gset_list <- list()
+gset_list[["glycolysis"]] <- unique( fgseas_df$pathway[ grepl("glyc",tolower(fgseas_df$pathway))] )
+gset_list[["oxidative"]] <- unique(fgseas_df$pathway[ grepl("oxidat",tolower(fgseas_df$pathway))])
+gset_list[["glycolysis"]] <- unique(fgseas_df$pathway[ grepl("glycol",tolower(fgseas_df$pathway))])
+gset_list[["atp"]] <- unique(fgseas_df$pathway[ grepl("atp",tolower(fgseas_df$pathway))])
+gset_list[["kegg"]] <- unique(fgseas_df$pathway[ ! fgseas_df$pathway %in% do.call(c, gset_list)])
+
+fgseas_df$name <- factor(fgseas_df$name, c("naive DN", "naive IL1RL1+","naive TSLPR+","naive DP","cancer DN","cancer IL1RL1+","cancer TSLPR+","cancer DP"))
+fgseas_df$cell <- sapply( as.character(fgseas_df$name), function(s) strsplit(s," ")[[1]][2])
+
+
+fgseas_df$cell2 <- nam2[ fgseas_df$cell]
+fgseas_df$cell2 <- factor(fgseas_df$cell2,levels=c("TSLPR-ST2- Treg","TSLPR-ST2+ Treg","TSLPR+ST2- Treg","TSLPR+ST2+ Treg"))
+dnnaive <- fgseas_df[ fgseas_df$name == "cancer DN",]
+dnnaive$name <- rep("naive DN",nrow(dnnaive))
+dnnaive$Median.logFC <- rep(0,nrow(dnnaive))
+dnnaive$discrete <- factor( rep("> 0.2",nrow(dnnaive)), levels=rev(c("<= 0.01","<= 0.05","<= 0.1","> 0.2")) )
+
+#nam2 <- c(expression(TSLPR^-ST2^- Treg),expression(TSLPR^-ST2^+ Treg),expression(TSLPR^+ST2^- Treg),expression(TSLPR^+ST2^+ Treg))
+nam2 <- c("TSLPR-ST2- Treg","TSLPR-ST2+ Treg","TSLPR+ST2- Treg","TSLPR+ST2+ Treg")
+names(nam2) <- c("DN","IL1RL1+","TSLPR+","DP")
+
+fgseas_df <- rbind( fgseas_df, dnnaive)
+for( i in 1:length(gset_list) ){
+  #for( samp in c("naive","cancer")){
+  for( samp in c("cancer","naive")){
+    nam <- names(gset_list)[i]
+    glist <- gset_list[[i]]
+    df <- fgseas_df[ !fgseas_df$pathway %in% taboo & fgseas_df$pathway %in% glist & grepl(samp,fgseas_df$name), ]
+    print(nam)
+    w <- 6.2
+    if( nam == "kegg" ){
+      w <- 6.7
+      h <- 3.2+length(unique(df$pathway))/8
+      pdf( paste0("../../data/2020-12-01/fgseas_dotplot_vNaiveDP_",nam,"_",samp,".pdf"),width=w,height=h)
+      p <- ggplot(df,aes(y=paste0(gsub("\n", " ",pathway)," signaling pathway"),x=cell2,size=discrete,color=Median.logFC))+ geom_point() + 
+    scale_colour_gradient2(low = "blue",mid="grey",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="enrichment FDR", color="median logFC\nvs. naive DN",x="cell sort",title=paste0( capitalize(samp), " cells"),y="pathway") + theme(axis.text.x = element_text(angle = 45, hjust=1, vjust=1))
+    }
+    else{
+      h <- 2.5+length(unique(df$pathway))/8
+      w <- 5.9
+      pdf( paste0("../../data/2020-12-01/fgseas_dotplot_vNaiveDP_",nam,"_",samp,".pdf"),width=w,height=h)
+      p <- ggplot(df,aes(y=gsub("\n", " ",pathway),x=cell2,size=discrete,color=Median.logFC))+ geom_point() + 
+    scale_colour_gradient2(low = "blue",mid="grey",high="red",midpoint=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + labs(size="enrichment FDR", color="median logFC\nvs. naive DN",x="cell sort",title=paste0( capitalize(samp), " cells"),y="pathway") + guides( size=FALSE) + theme(axis.text.x = element_text(angle = 45, hjust=1, vjust=1))
+    }
+    print(p)
+    #break
+    dev.off()
+  }
+#break
+}
+fgseas_df <- fgseas_df[ fgseas_df$name != "naive DN",]
+
+
+
+```
+
+
+```{r yet again}
+# Could you separate these small and bigger plots into cancer and naïve, and into signaling pathways and metabolism including oxidative phosphorylation, atp metabolism/synthesis, and glycolysis. And please add naïve DN in the figure. Figures will be totally 8 plots.
+# I think these figures look diffuse. Is it possible to change the balance of blank spaces and plots like below? And we need to describe full names of pathways in each figures. I think we can turn the plot clockwise 90 degrees.
+
+# 
+combolist <- c(kegggenes, c5_list)
+gset_list <- list()
+gset_list[["glycolysis"]] <- combolist[ grepl("glyc",tolower(names(combolist)))]
+
+```
+
+```{r look at kazushige's gene lists between the different sets?}
+
+genes <- c("Klrg1", "Icos","Tigit","Mef2c")
+
+table(genes %in% comparisons[[1]]$mgi_symbol)
+
+for( g in genes ){
+  ens <- rownames(comparisons[[1]])[ comparisons[[1]]$mgi_symbol == g ]
+  #design_qc$g <- log2(1+counts_pc_norm[ens,design_qc$libid])
+  design_qc$g <- log2(1+counts_mgi[ens,design_qc$libid])
+  print(summary(design_qc$g))
+  p <- ggplot(design_qc[design_qc$cancer != "Tn",],aes(x=sort2,y=g) ) + geom_boxplot() + geom_point() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_wrap(~cancer) + labs(x="IL1RL1 and ST2 expression",y="log2 normalized\nexpression",title=g)
+  pdf(paste0("../../data/2021-05-26/",g,"_boxplots.pdf"), height = 4, width = 6)
+  print(p)
+  dev.off()
+}
+
+ens <- rownames(comparisons[[1]])[ comparisons[[1]]$mgi_symbol %in% genes]
+dpcompnames <- names(comparisons)[ grepl("DP",names(comparisons))]
+for( dpcn in dpcompnames ){
+  df <- comparisons[[dpcn]][ens,]
+  write.table(df,paste0("../../data/2021-05-26/",dpcn,"_DPassociatedGenes.txt"),quote=FALSE,col.names=NA,sep="\t")
+}
+
+
+tfs <- read.csv( "../../data/2021-05-26/riken_mouse_tfs.csv",header=FALSE)
+ens <- rownames(comparisons[[1]])[ comparisons[[1]]$mgi_symbol %in% tfs$V2]
+dpcompnames <- names(comparisons)[ grepl("DP",names(comparisons))]
+for( dpcn in dpcompnames ){
+  df <- comparisons[[dpcn]][ens,]
+  df <- df[order(df$P.Value),]
+  write.table(df,paste0("../../data/2021-05-26/",dpcn,"_DPassociated_TFPvalues.txt"),quote=FALSE,col.n ames=NA,sep="\t")
+}
+
+cvnvcompnames <- names(comparisons)[ grepl("vnaive",names(comparisons))]
+for( dpcn in cvnvcompnames ){
+  df <- comparisons[[dpcn]][ens,]
+  df <- df[order(df$P.Value),]
+  write.table(df,paste0("../../data/2021-05-26/",dpcn,"_cancerVnaive_TFPvalues.txt"),quote=FALSE,col.names=NA,sep="\t")
+}
+
+```
+
+```{r look at exon/promoter usage?}
+options(stringsAsFactors = FALSE)
+d <- "../../data/2021-10-08/mef2Counts/"
+f <- list.files( d ); f <- f[ grepl("_counts.txt",f)]
+
+mef2counts <- lapply( paste0(d,f), function(fname) read.table(fname,sep="\t",header=FALSE))
+names(mef2counts) <- f
+
+if(FALSE){
+  exons <- t(data.frame( sapply( mef2counts, function(l) l[c(-1,-28,-55),"V5"]) ))
+  rownames(exons) <- sapply( names(mef2counts), function(s) strsplit(s,"_")[[1]][1])
+  colnames(exons) <- mef2counts[[1]][c(-1,-28,-55),"V4"]
+  colnames(exons) <- sapply(colnames(exons), function(s) paste(strsplit(s," ")[[1]][c(1,7)],collapse=".") )
+} else{
+  mef2regions <- t(data.frame( sapply( mef2counts, function(l) l[,"V5"]) ))
+  rownames(mef2regions) <- sapply( names(mef2counts), function(s) strsplit(s,"_")[[1]][1])
+  colnames(mef2regions) <- mef2counts[[1]][,"V4"]
+}
+for( r in rownames(mef2regions)){
+  if( counts_pc_norm[ "ENSMUSG00000005583", r] != 0 ){ 
+    mef2regions[r,] <- mef2regions[r,]/counts_pc_norm[ "ENSMUSG00000005583", r]
+  }
+}
+mef2regionsScaled <- scale(log2(0.01+mef2regions))
+mef2regionsScaled[ is.na(mef2regionsScaled )] <- 0
+mef2regionsScaled <- mef2regionsScaled[, colSums(mef2regionsScaled) != 0 ]
+libs <- rownames(mef2regionsScaled)
+sort2cols <- c("grey","black","red","blue","purple")
+names(sort2cols) <- c("Tn","DN","IL1RL1+","TSLPR+","DP")
+cancercols <- c("Tn"="grey","naive"="black","cancer"="red")
+ha = HeatmapAnnotation(df=design_qc[libs,c("cancer","sort2")], col=list(cancer=cancercols,sort2=sort2cols) )
+Heatmap(t(mef2regionsScaled), show_row_names=FALSE, top_annotation = ha, show_column_names=FALSE)
+
+## look at 5 prime UTR?
+z <- mef2regions[, colSums(mef2regions)!=0]
+z <- apply(z,2, function(col) paste(col, collapse=" "))
+z <- z[!duplicated(z)]
+m2 <- mef2regions[,names(z)]
+
+libs <- rownames(m2)
+sort2cols <- c("grey","black","red","blue","purple")
+names(sort2cols) <- c("Tn","DN","IL1RL1+","TSLPR+","DP")
+cancercols <- c("Tn"="grey","naive"="black","cancer"="red")
+ha = HeatmapAnnotation(df=design_qc[libs,c("cancer","sort2")], col=list(cancer=cancercols,sort2=sort2cols) )
+Heatmap(t(m2), show_row_names=FALSE, top_annotation = ha, show_column_names=FALSE,name="counts")
+
+a <- read.table("../../data/2021-10-08/galaxyAnnos/Mus_musculus.GRCm38.68.Mef2c.gtf",sep="\t",header=FALSE)
+a$version <- "GRCm38.68"
+b <- read.table("../../data/2021-10-08/galaxyAnnos/Mus_musculus.GRCm38.91.Mef2c.gtf",sep="\t",header=FALSE)
+b$version <- "GRCm38.91"
+combo <- rbind(a,b)
+combo$exon <- sapply( combo$V9, function(s) strsplit( strsplit(s,"exon_number ")[[1]][2], ";")[[1]][1])
+combo$supportlevel <- sapply( combo$V9, function(s) strsplit( strsplit(s,"transcript_support_level ")[[1]][2], ";")[[1]][1])
+
+ggplot(combo,aes(x=V4,y=V5, color=version,shape=version)) + geom_point(size=3) + scale_shape_manual(values=c(4,1)) + scale_color_manual(values=c("red","blue")) + facet_wrap(~V3, nrow=2)
+
+ggplot(combo[combo$V3 == "exon",],aes(x=V4,y=V5, color=version,shape=version)) + geom_point(size=3) + scale_shape_manual(values=c(4,1)) + scale_color_manual(values=c("red","blue")) + facet_wrap(~exon, nrow=2)
+
+ggplot(combo[combo$V3 == "exon" & combo$exon == "1",],aes(x=V4,y=V5, color=supportlevel,shape=version)) + geom_point(size=5) + scale_shape_manual(values=c(4,1)) + scale_color_manual(values=c("black","purple","red","blue","gold","green")) 
+
+write.table( b[,c("V1","V4","V5","V9")], "../../data/2021-10-08/galaxyAnnos/Mus_musculus.GRCm38.91.Mef2c.bed", sep="\t",col.names=FALSE,row.names=FALSE,quote=FALSE)
+
+z <- read.table("../../data/2021-10-08/galaxyAnnos/firstReadLocations.txt")
+anno <- anno[ order(anno$libid),]
+rownames(z) <- anno$libid
+colnames(z)[1] <- "firstReadLocation"
+z <- cbind( z, designm[ rownames(z),])
+z$Mef2counts <- counts_mgi["ENSMUSG00000005583",rownames(z) ]
+ggplot(z,aes(x=sort_short,y=firstReadLocation,color=cancer)) + geom_quasirandom() + labs(x="sort",y="first Mef2c read location",title="first Mef2c read location\nby sort and cancer") + scale_color_manual(values=c("cancer"="red","naive"="black"))
+write.table(z,"first_Mef2c_read_locations.txt",quote=FALSE,sep="\t",col.names=NA)
+
+ggplot(z,aes(x=Mef2counts,y=firstReadLocation,color=cancer)) + geom_quasirandom() + labs(x="total Mef2c reads",y="first Mef2c read location",title="first Mef2c read location\nby sort and cancer") + scale_color_manual(values=c("cancer"="red","naive"="black"))
+
+```
+
+```{r plot mef2c reads}
+
+d <- "../../data/2021-10-08/galaxyAnnos/Mef2c_sams/"
+f <- list.files(d)
+f <- f[ grepl(".sam",f)]
+sams <- lapply( paste0(d,f), function(fname) read.table(fname, sep=" "))
+
+getLocs <- function(l){
+  return( as.numeric( sapply(as.character(l[,1]), function(s) strsplit(s,"\t")[[1]][4])))
+}
+sams <- lapply(sams,getLocs)
+names(sams) <- sapply( f, function(s) strsplit(s,"_")[[1]][1])
+
+
+for( nam in names(sams) ){
+  print(nam)
+  print(length(sams[[nam]]))
+  sams[[nam]] <- data.frame( libid = rep(nam, length(sams[[nam]])), loc = sams[[nam]] )
+  sams[[nam]] <- sams[[nam]][ !is.na(sams[[nam]]$loc),]
+  sams[[nam]] <- cbind( sams[[nam]], designm[ sams[[nam]]$libid,c("sort_short","cancer")])
+  #print(unique(sams[[nam]]$libid))
+}
+sams <- do.call(rbind, sams)
+
+sortshort_cols <- c("grey","black","red","blue","purple")
+names(sortshort_cols) <- c("CD44low","TSLPR-Il1rl1-","TSLPR-Il1rl1+","TSLPR+Il1rl1-","TSLPR+Il1rl1+")
+sams$sort_short <- factor(sams$sort_short, levels=names(sortshort_cols))
+sams <- sams[ order(sams$sort_short, sams$libid),]
+sams$libid <- factor(sams$libid, levels=sams$libid[ ! duplicated( sams$libid)])
+pdf( "mef2c_reads.pdf",width=9,height=7)
+ggplot(sams, aes(x=loc,y=libid, color=sort_short)) + geom_point() + scale_color_manual(values=sortshort_cols)
+dev.off()
+ggplot(sams[sams$sort_short == "TSLPR+Il1rl1+",], aes(x=loc,y=libid, color=sort_short)) + geom_point() + scale_color_manual(values=sortshort_cols)
+
+
+
+xlim <- 83508833
+xmax <- 83667022
+ggplot(sams[sams$sort_short == "TSLPR+Il1rl1+",], aes(x=loc, fill=cancer)) + geom_histogram(binwidth=1500) + facet_wrap(~libid, ncol=1)  + xlim( c(xlim,xmax))
+
+
+#bsub <- b[ ! b$v3 %in% c("gene","transcript")]
+bsub <- b[ b$V3 %in% c("exon","CDS"),]
+#bsub <- a[ a$V3 %in% c("exon","CDS"),]
+bsub$id <- 1:nrow(bsub)
+bsub$exon <- as.factor(as.numeric( sapply( bsub$V9, function(s) gsub(" exon_number ","",strsplit(s,";")[[1]][5]) )))
+tp <- data.frame( loc=c(bsub$V4,bsub$V5), id=c(bsub$id, bsub$id), exon=c(bsub$exon, bsub$exon))
+tp$y <- rep(1,nrow(tp))
+ggplot(tp, aes(x=loc,y=y,group=id, color=as.factor(exon) )) + geom_line(size=11)  + xlim( c(xlim,xmax)) + labs(color="exon number")
+
+```
+
+```{r kaz TSS sites}
+# look at the Sams?
+
+#-1; chr13:83504304-83504310, chr13:83504234-83504255, chr13:83504161-83504227
+#+1; chr13:83573578-83573603
+#+2; chr13:83574476-83574484
+#+3; chr13:83575140-83575143
+#+4; chr13:83575626-83575634
+
+```
